@@ -373,6 +373,7 @@ class LiveTrader:
         self.topic_queue: queue.Queue[str] = queue.Queue()
         self.subscribed_topics: set[str] = set()
         self.last_error_notification = 0.0
+        self.startup_price_checked = False
 
     def notify_error(self, title: str, message: str) -> None:
         # Avoid flooding the phone when an upstream service is unavailable.
@@ -403,7 +404,7 @@ class LiveTrader:
         while not self.stop.is_set():
             try:
                 new_markets: list[str] = []
-                bootstrap_candidates: list[str] = []
+                current_candidates: list[str] = []
                 is_bootstrap = not self.state.market_baseline_ready
                 for market in self.markets_client.markets():
                     market_id = str(market.get("marketId") or market.get("id") or market.get("eventId") or "")
@@ -417,12 +418,12 @@ class LiveTrader:
                         continue
                     self.state.seen.add(market_id)
                     self.market_meta[market_id] = {"market": detail, "token_id": token[0], "outcome": token[1]}
+                    current_candidates.append(market_id)
                     if self.cfg.orderbook_topic_mode == "dynamic" and market_id not in self.subscribed_topics:
                         self.topic_queue.put(market_id)
                         self.subscribed_topics.add(market_id)
                         log.info("TRACKING football market id=%s outcome=%s", market_id, token[1])
                     if is_bootstrap:
-                        bootstrap_candidates.append(market_id)
                         continue
                     if not is_new:
                         continue
@@ -431,12 +432,16 @@ class LiveTrader:
                     new_markets.append(f"{title} | {token[1]} | id={market_id}")
                     if self.cfg.orderbook_topic_mode == "rest":
                         self.preview_market_price(market_id, "new market")
-                if is_bootstrap and bootstrap_candidates:
+                if not self.startup_price_checked and current_candidates:
                     # The newest Binance internal market ID is used only as a
-                    # startup verification sample; it does not create an order.
-                    newest_market_id = max(bootstrap_candidates, key=lambda value: int(value) if value.isdigit() else -1)
+                    # startup verification sample; it does not create an
+                    # order. This deliberately runs on every process start,
+                    # even when the persisted discovery baseline exists.
+                    newest_market_id = max(current_candidates, key=lambda value: int(value) if value.isdigit() else -1)
                     if self.cfg.orderbook_topic_mode == "rest":
                         self.preview_market_price(newest_market_id, "startup verification")
+                    self.startup_price_checked = True
+                if is_bootstrap:
                     self.state.market_baseline_ready = True
                 if new_markets:
                     # A market-list refresh can contain many new markets. Send

@@ -137,6 +137,10 @@ class Config:
     fee_bps: int = int(os.getenv("FEE_RATE_BPS", "200"))
     account_type: str = os.getenv("ACCOUNT_TYPE", "SPOT")
     funding_source: str = os.getenv("FUNDING_SOURCE", "MPC")
+    orderbook_topic_mode: str = os.getenv("ORDERBOOK_TOPIC_MODE", "aggregated").strip().lower()
+    # Keep the first connection small and observable. Set to 0 to subscribe
+    # to every discovered market, or raise it after confirming snapshots work.
+    max_markets_per_connection: int = int(os.getenv("MAX_MARKETS_PER_CONNECTION", "1"))
 
     @property
     def football_keywords(self) -> tuple[str, ...]:
@@ -362,6 +366,8 @@ class LiveTrader:
             raise RuntimeError("ENTRY_MAX_PRICE must be between 0 and 1")
         if not (self.cfg.entry_max < self.cfg.exit_min <= Decimal("1")):
             raise RuntimeError("EXIT_MIN_PRICE must be greater than ENTRY_MAX_PRICE and <= 1")
+        if self.cfg.orderbook_topic_mode not in {"aggregated", "dynamic"}:
+            raise RuntimeError("ORDERBOOK_TOPIC_MODE must be aggregated or dynamic")
 
     def discover_loop(self) -> None:
         while not self.stop.is_set():
@@ -379,7 +385,7 @@ class LiveTrader:
                         continue
                     self.state.seen.add(market_id)
                     self.market_meta[market_id] = {"market": detail, "token_id": token[0], "outcome": token[1]}
-                    if market_id not in self.subscribed_topics:
+                    if self.cfg.orderbook_topic_mode == "dynamic" and market_id not in self.subscribed_topics:
                         self.topic_queue.put(market_id)
                         self.subscribed_topics.add(market_id)
                         log.info("TRACKING football market id=%s outcome=%s", market_id, token[1])
@@ -410,17 +416,26 @@ class LiveTrader:
             return
         while not self.stop.is_set():
             try:
-                # Wait for discovery to identify at least one market before
-                # opening a dedicated per-market order-book subscription.
-                if self.topic_queue.empty():
-                    self.stop.wait(1)
-                    continue
-                initial_topics: list[str] = []
-                while len(initial_topics) < 1024:
-                    try:
-                        initial_topics.append(self.topic_queue.get_nowait())
-                    except queue.Empty:
-                        break
+                if self.cfg.orderbook_topic_mode == "aggregated":
+                    # One stream covers all active prediction markets. This
+                    # is the correct mode for detecting newly listed markets;
+                    # discovery filters incoming books to football.
+                    initial_topics = ["web3_prediction_orderbook_data"]
+                    log.info("Opening aggregated order-book subscription")
+                else:
+                    # Dynamic mode is useful when deliberately limiting the
+                    # connection to a small set of market IDs.
+                    if self.topic_queue.empty():
+                        self.stop.wait(1)
+                        continue
+                    initial_topics = []
+                    topic_limit = self.cfg.max_markets_per_connection if self.cfg.max_markets_per_connection > 0 else 1024
+                    while len(initial_topics) < topic_limit:
+                        try:
+                            initial_topics.append(self.topic_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    log.info("Opening dynamic order-book subscription for %d market(s): %s", len(initial_topics), ",".join(initial_topics))
                 self.binance.sync_time()
                 timestamp = self.binance.now_ms()
                 # Binance's SApi WSS docs recommend a random string (<=32
@@ -442,19 +457,24 @@ class LiveTrader:
                     ping_interval=20,
                     ping_timeout=10,
                 )
-                log.info("Connected to Binance prediction order-book stream")
+                log.info("Connected to Binance prediction order-book stream; waiting for subscription response/snapshot")
                 while not self.stop.is_set():
                     additional_topics: list[str] = []
-                    while len(additional_topics) < 1024:
-                        try:
-                            additional_topics.append(self.topic_queue.get_nowait())
-                        except queue.Empty:
-                            break
+                    if self.cfg.orderbook_topic_mode == "dynamic":
+                        while len(additional_topics) < 1024:
+                            try:
+                                additional_topics.append(self.topic_queue.get_nowait())
+                            except queue.Empty:
+                                break
                     if additional_topics:
+                        # Use the queued ID for each topic. Do not use the
+                        # stale `market_id` variable from the frame parser.
+                        topic_names = [f"web3_prediction_orderbook_{topic_id}" for topic_id in additional_topics]
+                        log.info("Subscribing to %d additional market(s): %s", len(topic_names), ",".join(additional_topics))
                         ws.send(json.dumps({
                             "id": str(uuid.uuid4()),
                             "method": "SUBSCRIBE",
-                            "params": [f"web3_prediction_orderbook_{market_id}" for market_id in additional_topics],
+                            "params": topic_names,
                         }))
                     try:
                         raw = ws.recv()
@@ -471,6 +491,16 @@ class LiveTrader:
                         break
                     log.debug("Binance WS frame: %s", str(raw)[:1000])
                     for envelope in decode_json_messages(raw):
+                        if str(envelope.get("type", "")).upper() == "COMMAND" or "code" in envelope or "success" in envelope:
+                            log.info(
+                                "Binance subscription response type=%s id=%s code=%s success=%s message=%s",
+                                envelope.get("type"),
+                                envelope.get("id"),
+                                envelope.get("code"),
+                                envelope.get("success"),
+                                envelope.get("message"),
+                            )
+                            continue
                         data = envelope.get("data", envelope)
                         if isinstance(data, str):
                             nested = decode_json_messages(data)
@@ -580,7 +610,14 @@ class LiveTrader:
 
     def run(self) -> None:
         self.validate()
-        log.warning("START live=%s buy_usdt=%s entry<=%s exit>=%s", self.cfg.live, self.cfg.buy_usdt, self.cfg.entry_max, self.cfg.exit_min)
+        log.warning(
+            "START live=%s buy_usdt=%s entry<=%s exit>=%s orderbook_mode=%s",
+            self.cfg.live,
+            self.cfg.buy_usdt,
+            self.cfg.entry_max,
+            self.cfg.exit_min,
+            self.cfg.orderbook_topic_mode,
+        )
         threads = [threading.Thread(target=self.discover_loop, daemon=True), threading.Thread(target=self.ws_loop, daemon=True), threading.Thread(target=self.reconcile_loop, daemon=True)]
         for thread in threads:
             thread.start()

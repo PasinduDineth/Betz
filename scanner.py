@@ -247,9 +247,6 @@ class BinanceClient:
             "orderType": "LIMIT",
             "slippageBps": slippage_bps,
             "priceLimit": str(price_limit),
-            "chainId": "56",
-            "feeRateBps": self.cfg.fee_bps,
-            "fundingSource": self.cfg.funding_source,
         }
         return self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote", body=body)
 
@@ -284,7 +281,11 @@ class BinanceClient:
         return str(result["orderId"])
 
     def order_history(self, market_id: str) -> list[dict[str, Any]]:
-        result = self.signed_request("GET", "/sapi/v1/w3w/wallet/prediction/order/history", params={"marketId": market_id, "limit": 100})
+        result = self.signed_request(
+            "GET",
+            "/sapi/v1/w3w/wallet/prediction/order/history",
+            params={"walletAddress": self.cfg.wallet_address, "marketId": market_id, "limit": 100},
+        )
         return result.get("orders", [])
 
 
@@ -437,6 +438,8 @@ class LiveTrader:
                         "public_price": str(public_price) if public_price is not None else "",
                     }
                     current_candidates.append(market_id)
+                    if self.cfg.orderbook_topic_mode == "rest":
+                        self.evaluate_public_price(market_id, is_new and not is_bootstrap)
                     if self.cfg.orderbook_topic_mode == "dynamic" and market_id not in self.subscribed_topics:
                         self.topic_queue.put(market_id)
                         self.subscribed_topics.add(market_id)
@@ -495,6 +498,26 @@ class LiveTrader:
             price,
             title,
         )
+
+    def evaluate_public_price(self, market_id: str, is_new: bool) -> None:
+        """Use public price as a signal, never as the final execution price."""
+        meta = self.market_meta.get(market_id)
+        if not meta:
+            return
+        price = dec(meta.get("public_price"))
+        if price is None:
+            return
+        # Only enter a newly discovered market. This prevents an older market
+        # from becoming an entry merely because the process restarted.
+        if is_new and price <= self.cfg.entry_max:
+            log.warning("ENTRY SIGNAL public_price=%s market=%s limit=%s", price, market_id, self.cfg.entry_max)
+            # A fresh LIMIT quote and order use ENTRY_MAX_PRICE as the hard cap;
+            # the public market-list price itself is not an execution promise.
+            self.try_buy(market_id, meta, self.cfg.entry_max)
+        position = self.state.positions.get(market_id)
+        if position and position.status == "FILLED" and price >= self.cfg.exit_min:
+            log.warning("EXIT SIGNAL public_price=%s market=%s limit=%s", price, market_id, self.cfg.exit_min)
+            self.try_sell(market_id, position, self.cfg.exit_min)
 
     def ws_loop(self) -> None:
         if self.cfg.orderbook_topic_mode == "rest":
@@ -652,7 +675,6 @@ class LiveTrader:
                 priority="high",
                 tags="chart_with_upwards_trend",
             )
-            self.state.orders_per_market[market_id] = self.cfg.max_per_market
             return
         try:
             quote = self.binance.get_quote(meta["token_id"], "BUY", self.cfg.buy_usdt, price, self.cfg.entry_slippage)

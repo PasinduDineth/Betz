@@ -5,10 +5,16 @@ This script never calls Place Order and cannot buy or sell anything.
 
 from __future__ import annotations
 
-from scanner import BinanceClient, BinanceMarketClient, Config, market_text, outcome_token
+import argparse
+from decimal import Decimal
+
+from scanner import BinanceClient, BinanceMarketClient, Config, market_text, outcome_public_price, outcome_token
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Run a no-order Binance Prediction Get Quote preflight")
+    parser.add_argument("--limit-price", help="Test a LIMIT quote at this price instead of a MARKET quote")
+    args = parser.parse_args()
     cfg = Config()
     if not all((cfg.binance_key, cfg.binance_secret, cfg.wallet_address)):
         raise SystemExit("Missing BINANCE_API_KEY, BINANCE_API_SECRET, or BINANCE_WALLET_ADDRESS")
@@ -33,7 +39,15 @@ def main() -> None:
     )
     client = BinanceClient(cfg)
     client.sync_time()
-    quote = client.get_market_quote(token_id, cfg.buy_usdt)
+    if args.limit_price:
+        limit_price = Decimal(args.limit_price)
+        if not (Decimal("0") < limit_price < Decimal("1")):
+            raise SystemExit("--limit-price must be between 0 and 1")
+        quote = client.get_quote(token_id, "BUY", cfg.buy_usdt, limit_price, cfg.entry_slippage)
+        quote_mode = f"LIMIT (price cap {limit_price})"
+    else:
+        quote = client.get_market_quote(token_id, cfg.buy_usdt)
+        quote_mode = "MARKET"
 
     # Deliberately omit quoteId: this command is a configuration check, not an
     # order workflow. A quote alone cannot move funds or place a trade.
@@ -41,6 +55,8 @@ def main() -> None:
     print(f"market_id={market_id}")
     print(f"title={market.get('title') or market.get('question') or market_id}")
     print(f"outcome={outcome}")
+    print(f"quote_mode={quote_mode}")
+    print(f"public_price={outcome_public_price(market, token_id)}")
     print(f"average_price={quote.get('averagePrice')}")
     print(f"last_price={quote.get('lastPrice')}")
     print(f"chance={quote.get('chance')}")

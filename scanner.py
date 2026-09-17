@@ -36,6 +36,32 @@ logging.basicConfig(
 log = logging.getLogger("prediction-trader")
 
 
+class Notifier:
+    """Optional ntfy mobile notifications; disabled when no topic is set."""
+
+    def __init__(self) -> None:
+        self.topic = os.getenv("NTFY_TOPIC", "").strip()
+        self.server = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+        self.session = requests.Session()
+
+    def send(self, title: str, message: str, priority: str = "default", tags: str = "") -> None:
+        if not self.topic:
+            return
+        try:
+            headers = {"Title": title, "Priority": priority}
+            if tags:
+                headers["Tags"] = tags
+            response = self.session.post(
+                f"{self.server}/{self.topic}",
+                data=message.encode("utf-8"),
+                headers=headers,
+                timeout=10,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            log.warning("Notification failed: %s", exc)
+
+
 def dec(value: Any, default: Decimal | None = None) -> Decimal | None:
     try:
         return Decimal(str(value))
@@ -308,6 +334,7 @@ class LiveTrader:
         self.state = State()
         self.markets_client = BinanceMarketClient(cfg)
         self.binance = BinanceClient(cfg)
+        self.notifier = Notifier()
         self.stop = threading.Event()
         self.books: dict[str, dict[str, Any]] = {}
         self.market_meta: dict[str, dict[str, Any]] = {}
@@ -336,7 +363,13 @@ class LiveTrader:
                         log.warning("New football market %s has no recognizable outcome token; skipped: %s", market_id, market_text(detail)[:160])
                         continue
                     self.market_meta[market_id] = {"market": detail, "token_id": token[0], "outcome": token[1]}
-                    log.info("NEW FOOTBALL MARKET id=%s outcome=%s token=%s title=%s", market_id, token[1], token[0], detail.get("title") or detail.get("question"))
+                    title = str(detail.get("title") or detail.get("question") or market_id)
+                    log.info("NEW FOOTBALL MARKET id=%s outcome=%s token=%s title=%s", market_id, token[1], token[0], title)
+                    self.notifier.send(
+                        "New Binance football market",
+                        f"{title}\nOutcome: {token[1]}\nMarket ID: {market_id}",
+                        tags="soccer",
+                    )
                 self.state.save()
             except Exception as exc:
                 log.exception("Discovery error: %s", exc)
@@ -419,6 +452,12 @@ class LiveTrader:
             return
         if not self.cfg.live:
             log.warning("SIGNAL ONLY live=false BUY market=%s token=%s price=%s amount=%s", market_id, meta["token_id"], price, self.cfg.buy_usdt)
+            self.notifier.send(
+                "Binance entry signal",
+                f"Market: {meta['market'].get('title') or meta['market'].get('question') or market_id}\nAsk: {price}\nAmount: {self.cfg.buy_usdt} USDT",
+                priority="high",
+                tags="chart_with_upwards_trend",
+            )
             self.state.orders_per_market[market_id] = self.cfg.max_per_market
             return
         try:
@@ -428,6 +467,7 @@ class LiveTrader:
             self.state.orders_per_market[market_id] = self.state.orders_per_market.get(market_id, 0) + 1
             self.state.save()
             log.warning("LIVE BUY submitted market=%s order=%s price=%s amount=%s", market_id, order_id, price, self.cfg.buy_usdt)
+            self.notifier.send("LIVE BUY submitted", f"Market: {market_id}\nPrice: {price}\nAmount: {self.cfg.buy_usdt} USDT", priority="high", tags="moneybag")
         except Exception as exc:
             log.exception("BUY failed market=%s: %s", market_id, exc)
 
@@ -437,6 +477,7 @@ class LiveTrader:
             return
         if not self.cfg.live:
             log.warning("SIGNAL ONLY live=false SELL market=%s price=%s shares=%s", market_id, price, shares)
+            self.notifier.send("Binance exit signal", f"Market: {market_id}\nBid: {price}\nShares: {shares}", priority="high", tags="moneybag")
             return
         try:
             quote = self.binance.get_quote(position.token_id, "SELL", shares, price, self.cfg.exit_slippage)
@@ -445,6 +486,7 @@ class LiveTrader:
             position.status = "SELL_PENDING"
             self.state.save()
             log.warning("LIVE SELL submitted market=%s order=%s price=%s shares=%s", market_id, order_id, price, shares)
+            self.notifier.send("LIVE SELL submitted", f"Market: {market_id}\nPrice: {price}\nShares: {shares}", priority="high", tags="moneybag")
         except Exception as exc:
             log.exception("SELL failed market=%s: %s", market_id, exc)
 

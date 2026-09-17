@@ -32,3 +32,38 @@ The bot needs a Binance API key/secret and Binance prediction wallet address/ID.
 - If credentials or required market/token fields are missing, the bot logs and skips rather than guessing.
 
 The Binance web market endpoint is not a stable public developer API and its request schema can change. The parser accepts common field names and logs an actionable error when a market cannot be mapped to an outcome token. The request body can be overridden with `BINANCE_MARKETS_BODY_JSON` after inspecting the browser request.
+
+## Free mobile alerts
+
+The scanner supports [ntfy](https://ntfy.sh), an open-source push notification system. Install the ntfy app on your phone, subscribe to a long random topic name, and set the same topic in `.env`:
+
+```env
+NTFY_SERVER=https://ntfy.sh
+NTFY_TOPIC=use-a-long-random-private-topic-name
+```
+
+The scanner sends alerts for new football markets, entry signals, exit signals, and live order submissions. Public ntfy topics are effectively bearer names, so do not use a short or guessable topic.
+
+## Run continuously on Ubuntu
+
+After cloning the project to the Droplet:
+
+```bash
+chmod +x install_service.sh
+./install_service.sh
+```
+
+If the script creates `.env`, edit it first, then run the installer again. The installer creates a systemd service that starts at boot, restarts after crashes, and continues after the SSH window closes.
+
+View logs:
+
+```bash
+sudo journalctl -u binance-prediction-scanner -f
+```
+
+Stop or restart:
+
+```bash
+sudo systemctl stop binance-prediction-scanner
+sudo systemctl restart binance-prediction-scanner
+```

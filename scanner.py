@@ -307,7 +307,10 @@ class BinanceMarketClient:
 
 
 def market_text(market: dict[str, Any]) -> str:
-    return " ".join(str(market.get(k, "")) for k in ("title", "question", "description", "slug")).lower()
+    return " ".join(
+        str(market.get(k, ""))
+        for k in ("title", "question", "description", "slug", "eventTitle", "eventSlug", "eventName")
+    ).lower()
 
 
 def outcome_token(market: dict[str, Any]) -> tuple[str, str] | None:
@@ -379,6 +382,7 @@ class LiveTrader:
                     if market_id not in self.subscribed_topics:
                         self.topic_queue.put(market_id)
                         self.subscribed_topics.add(market_id)
+                        log.info("TRACKING football market id=%s outcome=%s", market_id, token[1])
                     if not is_new:
                         continue
                     title = str(detail.get("title") or detail.get("question") or market_id)

@@ -170,6 +170,7 @@ class State:
         self.seen: set[str] = set()
         self.market_baseline_ready = False
         self.market_baseline_scope = ""
+        self.market_baseline_started_at_ms = 0
         self.positions: dict[str, Position] = {}
         self.orders_per_market: dict[str, int] = {}
         self.lock = threading.Lock()
@@ -183,6 +184,7 @@ class State:
             self.seen = set(raw.get("seen", []))
             self.market_baseline_ready = bool(raw.get("market_baseline_ready", False))
             self.market_baseline_scope = str(raw.get("market_baseline_scope", ""))
+            self.market_baseline_started_at_ms = int(raw.get("market_baseline_started_at_ms", 0) or 0)
             self.orders_per_market = {str(k): int(v) for k, v in raw.get("orders_per_market", {}).items()}
             self.positions = {k: Position(**v) for k, v in raw.get("positions", {}).items()}
         except Exception as exc:
@@ -194,6 +196,7 @@ class State:
                 "seen": sorted(self.seen),
                 "market_baseline_ready": self.market_baseline_ready,
                 "market_baseline_scope": self.market_baseline_scope,
+                "market_baseline_started_at_ms": self.market_baseline_started_at_ms,
                 "orders_per_market": self.orders_per_market,
                 "positions": {k: asdict(v) for k, v in self.positions.items()},
             }
@@ -201,10 +204,14 @@ class State:
 
     def prepare_discovery_scope(self, scope: str) -> bool:
         """Require a full no-trade baseline whenever discovery scope changes."""
-        if self.market_baseline_scope == scope:
+        if self.market_baseline_scope == scope and self.market_baseline_started_at_ms > 0:
             return False
         self.market_baseline_scope = scope
         self.market_baseline_ready = False
+        # `publishAt` values from Binance are epoch milliseconds. Persisting
+        # this cutoff means an already-created event returned late by a
+        # changing/paginated feed cannot become eligible after the baseline.
+        self.market_baseline_started_at_ms = int(time.time() * 1000)
         self.save()
         return True
 
@@ -416,6 +423,16 @@ def market_is_in_scope(market: dict[str, Any], cfg: Config) -> bool:
     return any(keyword in market_text(market) for keyword in cfg.football_keywords)
 
 
+def market_publish_at_ms(market: dict[str, Any]) -> int:
+    """Return Binance's event publication timestamp, or zero when absent."""
+    return int(dec(market.get("publishAt"), Decimal("0")) or Decimal("0"))
+
+
+def market_is_newer_than_baseline(market: dict[str, Any], baseline_started_at_ms: int) -> bool:
+    """Only an event published after the baseline is eligible for entry."""
+    return market_publish_at_ms(market) > baseline_started_at_ms
+
+
 def outcome_token(market: dict[str, Any]) -> tuple[str, str] | None:
     outcomes = market.get("outcomes") or market.get("tokens") or market.get("outcomeTokens") or []
     if isinstance(outcomes, dict):
@@ -505,6 +522,12 @@ class LiveTrader:
                     if not market_id or not market_is_in_scope(market, self.cfg):
                         continue
                     is_new = market_id not in self.state.seen
+                    published_at = market_publish_at_ms(market)
+                    eligible_for_entry = (
+                        is_new
+                        and not is_bootstrap
+                        and market_is_newer_than_baseline(market, self.state.market_baseline_started_at_ms)
+                    )
                     detail = market
                     token = outcome_token(detail)
                     if not token:
@@ -521,7 +544,7 @@ class LiveTrader:
                     }
                     current_candidates.append(market_id)
                     if self.cfg.orderbook_topic_mode == "rest":
-                        self.evaluate_rest_order_book(market_id, is_new and not is_bootstrap)
+                        self.evaluate_rest_order_book(market_id, eligible_for_entry)
                     if self.cfg.orderbook_topic_mode == "dynamic" and market_id not in self.subscribed_topics:
                         self.topic_queue.put(market_id)
                         self.subscribed_topics.add(market_id)
@@ -531,7 +554,23 @@ class LiveTrader:
                     if not is_new:
                         continue
                     title = str(detail.get("title") or detail.get("question") or market_id)
-                    log.info("NEW MARKET scope=%s id=%s outcome=%s token=%s title=%s", self.cfg.market_scope, market_id, token[1], token[0], title)
+                    if not eligible_for_entry and not is_bootstrap:
+                        log.info(
+                            "LATE DISCOVERY scope=%s id=%s publish_at=%s baseline_at=%s; alerting but not tradable",
+                            self.cfg.market_scope,
+                            market_id,
+                            published_at or None,
+                            self.state.market_baseline_started_at_ms,
+                        )
+                    log.info(
+                        "NEW MARKET scope=%s eligible=%s id=%s outcome=%s token=%s title=%s",
+                        self.cfg.market_scope,
+                        eligible_for_entry,
+                        market_id,
+                        token[1],
+                        token[0],
+                        title,
+                    )
                     new_markets.append(f"{title} | {token[1]} | price={public_price} | id={market_id}")
                     if self.cfg.orderbook_topic_mode == "rest":
                         self.log_public_market_price(market_id, "new market discovery")

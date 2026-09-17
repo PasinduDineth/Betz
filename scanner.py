@@ -253,6 +253,21 @@ class BinanceClient:
         }
         return self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote", body=body)
 
+    def get_market_quote(self, token_id: str, amount_usdt: Decimal) -> dict[str, Any]:
+        """Get an executable BUY quote. This endpoint does not place an order."""
+        # These are the required Get Quote fields from Binance's Prediction
+        # Trading REST documentation. Keep optional fields out of this
+        # preflight so it validates the account/wallet setup unambiguously.
+        body = {
+            "walletAddress": self.cfg.wallet_address,
+            "tokenId": token_id,
+            "side": "BUY",
+            "amountIn": str(int(amount_usdt * Decimal(10**18))),
+            "orderType": "MARKET",
+            "slippageBps": self.cfg.entry_slippage,
+        }
+        return self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote", body=body)
+
     def place_limit(self, quote: dict[str, Any], price_limit: Decimal, slippage_bps: int) -> str:
         body = {
             "walletAddress": self.cfg.wallet_address,

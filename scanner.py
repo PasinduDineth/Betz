@@ -360,6 +360,7 @@ class LiveTrader:
     def discover_loop(self) -> None:
         while not self.stop.is_set():
             try:
+                new_markets: list[str] = []
                 for market in self.markets_client.markets():
                     market_id = str(market.get("marketId") or market.get("id") or market.get("eventId") or "")
                     if not market_id or market_id in self.state.seen or not any(k in market_text(market) for k in self.cfg.football_keywords):
@@ -373,9 +374,15 @@ class LiveTrader:
                     self.market_meta[market_id] = {"market": detail, "token_id": token[0], "outcome": token[1]}
                     title = str(detail.get("title") or detail.get("question") or market_id)
                     log.info("NEW FOOTBALL MARKET id=%s outcome=%s token=%s title=%s", market_id, token[1], token[0], title)
+                    new_markets.append(f"{title} | {token[1]} | id={market_id}")
+                if new_markets:
+                    # A market-list refresh can contain many new markets. Send
+                    # one digest so ntfy is not flooded and rate-limited.
+                    shown = new_markets[:20]
+                    suffix = "" if len(new_markets) <= len(shown) else f"\n…and {len(new_markets) - len(shown)} more"
                     self.notifier.send(
-                        "New Binance football market",
-                        f"{title}\nOutcome: {token[1]}\nMarket ID: {market_id}",
+                        f"{len(new_markets)} new Binance football market(s)",
+                        "\n".join(shown) + suffix,
                         tags="soccer",
                     )
                 self.state.save()

@@ -222,14 +222,18 @@ class BinanceClient:
         params.setdefault("timestamp", self.now_ms())
         params.setdefault("recvWindow", 5000)
         body = dict(body or {})
+        # Binance validates the *raw* query string plus the raw form body.
+        # Build each once and reuse the same encoded strings for signing and
+        # transport. Passing dictionaries to requests is unsafe here because
+        # requests can serialize their key order differently from the signed
+        # representation, resulting in error -1022.
         query = urllib.parse.urlencode(sorted((k, str(v)) for k, v in params.items()))
         encoded_body = urllib.parse.urlencode(sorted((k, str(v)) for k, v in body.items()))
-        # Binance defines totalParams as the encoded query string concatenated
-        # with the encoded request body for signed endpoints.
         signature_payload = query + encoded_body
-        params["signature"] = hmac.new(self.cfg.binance_secret.encode(), signature_payload.encode(), hashlib.sha256).hexdigest()
-        url = self.cfg.binance_rest.rstrip("/") + path
-        response = self.session.request(method, url, params=params, data=body, timeout=15)
+        signature = hmac.new(self.cfg.binance_secret.encode(), signature_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        signed_query = f"{query}&signature={signature}" if query else f"signature={signature}"
+        url = self.cfg.binance_rest.rstrip("/") + path + "?" + signed_query
+        response = self.session.request(method, url, data=encoded_body or None, timeout=15)
         if not response.ok:
             raise RuntimeError(f"Binance {response.status_code}: {response.text[:500]}")
         return response.json()

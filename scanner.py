@@ -253,21 +253,6 @@ class BinanceClient:
         }
         return self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote", body=body)
 
-    def get_market_price_preview(self, token_id: str, amount_usdt: Decimal) -> dict[str, Any]:
-        """Request an executable market quote without creating an order."""
-        body = {
-            "walletAddress": self.cfg.wallet_address,
-            "tokenId": token_id,
-            "side": "BUY",
-            "amountIn": str(int(amount_usdt * Decimal(10**18))),
-            "orderType": "MARKET",
-            "slippageBps": self.cfg.entry_slippage,
-            "chainId": "56",
-            "feeRateBps": self.cfg.fee_bps,
-            "fundingSource": self.cfg.funding_source,
-        }
-        return self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote", body=body)
-
     def place_limit(self, quote: dict[str, Any], price_limit: Decimal, slippage_bps: int) -> str:
         body = {
             "walletAddress": self.cfg.wallet_address,
@@ -360,6 +345,20 @@ def outcome_token(market: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+def outcome_public_price(market: dict[str, Any], token_id: str) -> Decimal | None:
+    """Return the public REST price for the selected outcome token, if present."""
+    outcomes = market.get("outcomes") or market.get("tokens") or market.get("outcomeTokens") or []
+    if isinstance(outcomes, dict):
+        outcomes = list(outcomes.values())
+    for item in outcomes:
+        if not isinstance(item, dict):
+            continue
+        item_token = item.get("tokenId") or item.get("token_id") or item.get("id")
+        if str(item_token) == token_id:
+            return dec(item.get("price"))
+    return None
+
+
 class LiveTrader:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -393,8 +392,6 @@ class LiveTrader:
             raise RuntimeError("EXIT_MIN_PRICE must be greater than ENTRY_MAX_PRICE and <= 1")
         if self.cfg.orderbook_topic_mode not in {"rest", "aggregated", "dynamic"}:
             raise RuntimeError("ORDERBOOK_TOPIC_MODE must be rest, aggregated, or dynamic")
-        if self.cfg.orderbook_topic_mode == "rest" and not all((self.cfg.binance_key, self.cfg.binance_secret, self.cfg.wallet_address)):
-            raise RuntimeError("REST price previews require BINANCE_API_KEY, BINANCE_API_SECRET, and BINANCE_WALLET_ADDRESS")
         if not (0 < self.cfg.ws_ping_seconds < 30):
             raise RuntimeError("WS_PING_SECONDS must be greater than 0 and less than 30")
         if self.cfg.ws_recv_timeout <= 0:
@@ -417,7 +414,13 @@ class LiveTrader:
                         log.warning("New football market %s has no recognizable outcome token; skipped: %s", market_id, market_text(detail)[:160])
                         continue
                     self.state.seen.add(market_id)
-                    self.market_meta[market_id] = {"market": detail, "token_id": token[0], "outcome": token[1]}
+                    public_price = outcome_public_price(detail, token[0])
+                    self.market_meta[market_id] = {
+                        "market": detail,
+                        "token_id": token[0],
+                        "outcome": token[1],
+                        "public_price": str(public_price) if public_price is not None else "",
+                    }
                     current_candidates.append(market_id)
                     if self.cfg.orderbook_topic_mode == "dynamic" and market_id not in self.subscribed_topics:
                         self.topic_queue.put(market_id)
@@ -429,9 +432,9 @@ class LiveTrader:
                         continue
                     title = str(detail.get("title") or detail.get("question") or market_id)
                     log.info("NEW FOOTBALL MARKET id=%s outcome=%s token=%s title=%s", market_id, token[1], token[0], title)
-                    new_markets.append(f"{title} | {token[1]} | id={market_id}")
+                    new_markets.append(f"{title} | {token[1]} | price={public_price} | id={market_id}")
                     if self.cfg.orderbook_topic_mode == "rest":
-                        self.preview_market_price(market_id, "new market")
+                        self.log_public_market_price(market_id, "new market")
                 if not self.startup_price_checked and current_candidates:
                     # The newest Binance internal market ID is used only as a
                     # startup verification sample; it does not create an
@@ -439,7 +442,7 @@ class LiveTrader:
                     # even when the persisted discovery baseline exists.
                     newest_market_id = max(current_candidates, key=lambda value: int(value) if value.isdigit() else -1)
                     if self.cfg.orderbook_topic_mode == "rest":
-                        self.preview_market_price(newest_market_id, "startup verification")
+                        self.log_public_market_price(newest_market_id, "startup verification")
                     self.startup_price_checked = True
                 if is_bootstrap:
                     self.state.market_baseline_ready = True
@@ -459,32 +462,28 @@ class LiveTrader:
                 self.notify_error("Scanner discovery error", str(exc))
             self.stop.wait(self.cfg.market_poll)
 
-    def preview_market_price(self, market_id: str, reason: str) -> None:
-        """Log a no-order REST price preview for one discovered market."""
+    def log_public_market_price(self, market_id: str, reason: str) -> None:
+        """Log price already returned by Binance's public market-list REST call."""
         meta = self.market_meta.get(market_id)
         if not meta:
             return
-        try:
-            self.binance.sync_time()
-            quote = self.binance.get_market_price_preview(meta["token_id"], self.cfg.buy_usdt)
-            title = str(meta["market"].get("title") or meta["market"].get("question") or market_id)
-            log.warning(
-                "REST PRICE PREVIEW reason=%s market=%s outcome=%s average=%s last=%s chance=%s title=%s",
-                reason,
-                market_id,
-                meta["outcome"],
-                quote.get("averagePrice"),
-                quote.get("lastPrice"),
-                quote.get("chance"),
-                title,
-            )
-        except Exception as exc:
-            log.warning("REST price preview failed reason=%s market=%s: %s", reason, market_id, exc)
-            self.notify_error("Scanner REST price preview failed", str(exc))
+        title = str(meta["market"].get("title") or meta["market"].get("question") or market_id)
+        price = meta.get("public_price") or None
+        if price is None:
+            log.warning("PUBLIC REST PRICE unavailable reason=%s market=%s outcome=%s title=%s", reason, market_id, meta["outcome"], title)
+            return
+        log.warning(
+            "PUBLIC REST PRICE reason=%s market=%s outcome=%s price=%s title=%s",
+            reason,
+            market_id,
+            meta["outcome"],
+            price,
+            title,
+        )
 
     def ws_loop(self) -> None:
         if self.cfg.orderbook_topic_mode == "rest":
-            log.info("Order-book WebSocket disabled; using REST price previews for startup and new markets")
+            log.info("Order-book WebSocket disabled; using public REST market prices for startup and new markets")
             return
         if not self.cfg.binance_key or not self.cfg.binance_secret:
             log.warning("BINANCE credentials missing: market discovery will run, order-book/trading will not")

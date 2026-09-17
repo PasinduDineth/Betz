@@ -137,10 +137,12 @@ class Config:
     fee_bps: int = int(os.getenv("FEE_RATE_BPS", "200"))
     account_type: str = os.getenv("ACCOUNT_TYPE", "SPOT")
     funding_source: str = os.getenv("FUNDING_SOURCE", "MPC")
-    orderbook_topic_mode: str = os.getenv("ORDERBOOK_TOPIC_MODE", "aggregated").strip().lower()
+    orderbook_topic_mode: str = os.getenv("ORDERBOOK_TOPIC_MODE", "rest").strip().lower()
     # Keep the first connection small and observable. Set to 0 to subscribe
     # to every discovered market, or raise it after confirming snapshots work.
     max_markets_per_connection: int = int(os.getenv("MAX_MARKETS_PER_CONNECTION", "1"))
+    ws_ping_seconds: float = float(os.getenv("WS_PING_SECONDS", "25"))
+    ws_recv_timeout: float = float(os.getenv("WS_RECV_TIMEOUT_SECONDS", "5"))
 
     @property
     def football_keywords(self) -> tuple[str, ...]:
@@ -164,6 +166,7 @@ class State:
     def __init__(self) -> None:
         self.path = DATA_DIR / "state.json"
         self.seen: set[str] = set()
+        self.market_baseline_ready = False
         self.positions: dict[str, Position] = {}
         self.orders_per_market: dict[str, int] = {}
         self.lock = threading.Lock()
@@ -175,6 +178,7 @@ class State:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             self.seen = set(raw.get("seen", []))
+            self.market_baseline_ready = bool(raw.get("market_baseline_ready", False))
             self.orders_per_market = {str(k): int(v) for k, v in raw.get("orders_per_market", {}).items()}
             self.positions = {k: Position(**v) for k, v in raw.get("positions", {}).items()}
         except Exception as exc:
@@ -184,6 +188,7 @@ class State:
         with self.lock:
             payload = {
                 "seen": sorted(self.seen),
+                "market_baseline_ready": self.market_baseline_ready,
                 "orders_per_market": self.orders_per_market,
                 "positions": {k: asdict(v) for k, v in self.positions.items()},
             }
@@ -238,6 +243,21 @@ class BinanceClient:
             "orderType": "LIMIT",
             "slippageBps": slippage_bps,
             "priceLimit": str(price_limit),
+            "chainId": "56",
+            "feeRateBps": self.cfg.fee_bps,
+            "fundingSource": self.cfg.funding_source,
+        }
+        return self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote", body=body)
+
+    def get_market_price_preview(self, token_id: str, amount_usdt: Decimal) -> dict[str, Any]:
+        """Request an executable market quote without creating an order."""
+        body = {
+            "walletAddress": self.cfg.wallet_address,
+            "tokenId": token_id,
+            "side": "BUY",
+            "amountIn": str(int(amount_usdt * Decimal(10**18))),
+            "orderType": "MARKET",
+            "slippageBps": self.cfg.entry_slippage,
             "chainId": "56",
             "feeRateBps": self.cfg.fee_bps,
             "fundingSource": self.cfg.funding_source,
@@ -366,13 +386,21 @@ class LiveTrader:
             raise RuntimeError("ENTRY_MAX_PRICE must be between 0 and 1")
         if not (self.cfg.entry_max < self.cfg.exit_min <= Decimal("1")):
             raise RuntimeError("EXIT_MIN_PRICE must be greater than ENTRY_MAX_PRICE and <= 1")
-        if self.cfg.orderbook_topic_mode not in {"aggregated", "dynamic"}:
-            raise RuntimeError("ORDERBOOK_TOPIC_MODE must be aggregated or dynamic")
+        if self.cfg.orderbook_topic_mode not in {"rest", "aggregated", "dynamic"}:
+            raise RuntimeError("ORDERBOOK_TOPIC_MODE must be rest, aggregated, or dynamic")
+        if self.cfg.orderbook_topic_mode == "rest" and not all((self.cfg.binance_key, self.cfg.binance_secret, self.cfg.wallet_address)):
+            raise RuntimeError("REST price previews require BINANCE_API_KEY, BINANCE_API_SECRET, and BINANCE_WALLET_ADDRESS")
+        if not (0 < self.cfg.ws_ping_seconds < 30):
+            raise RuntimeError("WS_PING_SECONDS must be greater than 0 and less than 30")
+        if self.cfg.ws_recv_timeout <= 0:
+            raise RuntimeError("WS_RECV_TIMEOUT_SECONDS must be greater than 0")
 
     def discover_loop(self) -> None:
         while not self.stop.is_set():
             try:
                 new_markets: list[str] = []
+                bootstrap_candidates: list[str] = []
+                is_bootstrap = not self.state.market_baseline_ready
                 for market in self.markets_client.markets():
                     market_id = str(market.get("marketId") or market.get("id") or market.get("eventId") or "")
                     if not market_id or not any(k in market_text(market) for k in self.cfg.football_keywords):
@@ -389,11 +417,23 @@ class LiveTrader:
                         self.topic_queue.put(market_id)
                         self.subscribed_topics.add(market_id)
                         log.info("TRACKING football market id=%s outcome=%s", market_id, token[1])
+                    if is_bootstrap:
+                        bootstrap_candidates.append(market_id)
+                        continue
                     if not is_new:
                         continue
                     title = str(detail.get("title") or detail.get("question") or market_id)
                     log.info("NEW FOOTBALL MARKET id=%s outcome=%s token=%s title=%s", market_id, token[1], token[0], title)
                     new_markets.append(f"{title} | {token[1]} | id={market_id}")
+                    if self.cfg.orderbook_topic_mode == "rest":
+                        self.preview_market_price(market_id, "new market")
+                if is_bootstrap and bootstrap_candidates:
+                    # The newest Binance internal market ID is used only as a
+                    # startup verification sample; it does not create an order.
+                    newest_market_id = max(bootstrap_candidates, key=lambda value: int(value) if value.isdigit() else -1)
+                    if self.cfg.orderbook_topic_mode == "rest":
+                        self.preview_market_price(newest_market_id, "startup verification")
+                    self.state.market_baseline_ready = True
                 if new_markets:
                     # A market-list refresh can contain many new markets. Send
                     # one digest so ntfy is not flooded and rate-limited.
@@ -410,7 +450,33 @@ class LiveTrader:
                 self.notify_error("Scanner discovery error", str(exc))
             self.stop.wait(self.cfg.market_poll)
 
+    def preview_market_price(self, market_id: str, reason: str) -> None:
+        """Log a no-order REST price preview for one discovered market."""
+        meta = self.market_meta.get(market_id)
+        if not meta:
+            return
+        try:
+            self.binance.sync_time()
+            quote = self.binance.get_market_price_preview(meta["token_id"], self.cfg.buy_usdt)
+            title = str(meta["market"].get("title") or meta["market"].get("question") or market_id)
+            log.warning(
+                "REST PRICE PREVIEW reason=%s market=%s outcome=%s average=%s last=%s chance=%s title=%s",
+                reason,
+                market_id,
+                meta["outcome"],
+                quote.get("averagePrice"),
+                quote.get("lastPrice"),
+                quote.get("chance"),
+                title,
+            )
+        except Exception as exc:
+            log.warning("REST price preview failed reason=%s market=%s: %s", reason, market_id, exc)
+            self.notify_error("Scanner REST price preview failed", str(exc))
+
     def ws_loop(self) -> None:
+        if self.cfg.orderbook_topic_mode == "rest":
+            log.info("Order-book WebSocket disabled; using REST price previews for startup and new markets")
+            return
         if not self.cfg.binance_key or not self.cfg.binance_secret:
             log.warning("BINANCE credentials missing: market discovery will run, order-book/trading will not")
             return
@@ -453,10 +519,14 @@ class LiveTrader:
                     url,
                     header=[f"X-MBX-APIKEY: {self.cfg.binance_key}"],
                     origin="https://www.binance.com",
-                    timeout=30,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    timeout=10,
                 )
+                # `websocket.create_connection` does not run a ping thread;
+                # its ping_interval argument is ignored by websocket-client.
+                # Binance closes a connection that has not received a WebSocket
+                # PING frame within one minute, so send one ourselves below.
+                ws.settimeout(self.cfg.ws_recv_timeout)
+                last_ping = time.monotonic()
                 log.info("Connected to Binance prediction order-book stream; waiting for subscription response/snapshot")
                 while not self.stop.is_set():
                     additional_topics: list[str] = []
@@ -472,10 +542,15 @@ class LiveTrader:
                         topic_names = [f"web3_prediction_orderbook_{topic_id}" for topic_id in additional_topics]
                         log.info("Subscribing to %d additional market(s): %s", len(topic_names), ",".join(additional_topics))
                         ws.send(json.dumps({
-                            "id": str(uuid.uuid4()),
-                            "method": "SUBSCRIBE",
-                            "params": topic_names,
+                            # Binance CMS uses command/value, with multiple
+                            # topics concatenated by |, not the Spot WS schema.
+                            "command": "SUBSCRIBE",
+                            "value": "|".join(topic_names),
                         }))
+                    if time.monotonic() - last_ping >= self.cfg.ws_ping_seconds:
+                        ws.ping()
+                        last_ping = time.monotonic()
+                        log.debug("Sent Binance order-book heartbeat")
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
@@ -493,12 +568,11 @@ class LiveTrader:
                     for envelope in decode_json_messages(raw):
                         if str(envelope.get("type", "")).upper() == "COMMAND" or "code" in envelope or "success" in envelope:
                             log.info(
-                                "Binance subscription response type=%s id=%s code=%s success=%s message=%s",
+                                "Binance subscription response type=%s action=%s code=%s status=%s",
                                 envelope.get("type"),
-                                envelope.get("id"),
+                                envelope.get("subType"),
                                 envelope.get("code"),
-                                envelope.get("success"),
-                                envelope.get("message"),
+                                envelope.get("data") or envelope.get("message") or envelope.get("success"),
                             )
                             continue
                         data = envelope.get("data", envelope)

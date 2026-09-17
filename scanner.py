@@ -338,6 +338,14 @@ class LiveTrader:
         self.stop = threading.Event()
         self.books: dict[str, dict[str, Any]] = {}
         self.market_meta: dict[str, dict[str, Any]] = {}
+        self.last_error_notification = 0.0
+
+    def notify_error(self, title: str, message: str) -> None:
+        # Avoid flooding the phone when an upstream service is unavailable.
+        now = time.time()
+        if now - self.last_error_notification >= 600:
+            self.last_error_notification = now
+            self.notifier.send(title, message[:800], priority="high", tags="warning")
 
     def validate(self) -> None:
         if self.cfg.live and not all((self.cfg.binance_key, self.cfg.binance_secret, self.cfg.wallet_address, self.cfg.wallet_id)):
@@ -373,6 +381,7 @@ class LiveTrader:
                 self.state.save()
             except Exception as exc:
                 log.exception("Discovery error: %s", exc)
+                self.notify_error("Scanner discovery error", str(exc))
             self.stop.wait(self.cfg.market_poll)
 
     def ws_loop(self) -> None:
@@ -426,6 +435,7 @@ class LiveTrader:
                 ws.close()
             except Exception as exc:
                 log.warning("Order-book stream error: %s; reconnecting", exc)
+                self.notify_error("Scanner Binance connection error", str(exc))
                 self.stop.wait(5)
             else:
                 self.stop.wait(5)

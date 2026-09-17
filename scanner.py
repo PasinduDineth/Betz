@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import signal
 import threading
 import time
@@ -338,6 +339,8 @@ class LiveTrader:
         self.stop = threading.Event()
         self.books: dict[str, dict[str, Any]] = {}
         self.market_meta: dict[str, dict[str, Any]] = {}
+        self.topic_queue: queue.Queue[str] = queue.Queue()
+        self.subscribed_topics: set[str] = set()
         self.last_error_notification = 0.0
 
     def notify_error(self, title: str, message: str) -> None:
@@ -363,15 +366,21 @@ class LiveTrader:
                 new_markets: list[str] = []
                 for market in self.markets_client.markets():
                     market_id = str(market.get("marketId") or market.get("id") or market.get("eventId") or "")
-                    if not market_id or market_id in self.state.seen or not any(k in market_text(market) for k in self.cfg.football_keywords):
+                    if not market_id or not any(k in market_text(market) for k in self.cfg.football_keywords):
                         continue
-                    self.state.seen.add(market_id)
+                    is_new = market_id not in self.state.seen
                     detail = market
                     token = outcome_token(detail)
                     if not token:
                         log.warning("New football market %s has no recognizable outcome token; skipped: %s", market_id, market_text(detail)[:160])
                         continue
+                    self.state.seen.add(market_id)
                     self.market_meta[market_id] = {"market": detail, "token_id": token[0], "outcome": token[1]}
+                    if market_id not in self.subscribed_topics:
+                        self.topic_queue.put(market_id)
+                        self.subscribed_topics.add(market_id)
+                    if not is_new:
+                        continue
                     title = str(detail.get("title") or detail.get("question") or market_id)
                     log.info("NEW FOOTBALL MARKET id=%s outcome=%s token=%s title=%s", market_id, token[1], token[0], title)
                     new_markets.append(f"{title} | {token[1]} | id={market_id}")
@@ -397,12 +406,24 @@ class LiveTrader:
             return
         while not self.stop.is_set():
             try:
+                # Wait for discovery to identify at least one market before
+                # opening a dedicated per-market order-book subscription.
+                if self.topic_queue.empty():
+                    self.stop.wait(1)
+                    continue
+                initial_topics: list[str] = []
+                while len(initial_topics) < 1024:
+                    try:
+                        initial_topics.append(self.topic_queue.get_nowait())
+                    except queue.Empty:
+                        break
                 self.binance.sync_time()
                 timestamp = self.binance.now_ms()
                 # Binance's SApi WSS docs recommend a random string (<=32
                 # chars) for `random`; a UUID avoids reusing timestamp-only
                 # session identifiers during rapid reconnects.
-                params = {"random": uuid.uuid4().hex, "topic": "web3_prediction_orderbook_data", "recvWindow": 30000, "timestamp": timestamp}
+                topic = "|".join(f"web3_prediction_orderbook_{market_id}" for market_id in initial_topics)
+                params = {"random": uuid.uuid4().hex, "topic": topic, "recvWindow": 30000, "timestamp": timestamp}
                 # Binance's prediction-orderbook documentation requires the
                 # signature payload to be sorted alphabetically by parameter
                 # name. The final URL can retain the same canonical order.
@@ -419,7 +440,24 @@ class LiveTrader:
                 )
                 log.info("Connected to Binance prediction order-book stream")
                 while not self.stop.is_set():
-                    raw = ws.recv()
+                    additional_topics: list[str] = []
+                    while len(additional_topics) < 1024:
+                        try:
+                            additional_topics.append(self.topic_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    if additional_topics:
+                        ws.send(json.dumps({
+                            "id": str(uuid.uuid4()),
+                            "method": "SUBSCRIBE",
+                            "params": [f"web3_prediction_orderbook_{market_id}" for market_id in additional_topics],
+                        }))
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        # A quiet market is not a dead connection; keep the
+                        # socket alive and check for newly discovered topics.
+                        continue
                     if not raw:
                         log.warning(
                             "Binance closed the order-book stream without a payload code=%s reason=%s",
@@ -438,6 +476,14 @@ class LiveTrader:
                         market_id = str(data.get("marketId", ""))
                         if market_id:
                             self.books[market_id] = data
+                            asks = data.get("asks") or []
+                            bids = data.get("bids") or []
+                            log.info(
+                                "Order book snapshot/update market=%s ask=%s bid=%s",
+                                market_id,
+                                asks[0][0] if asks else None,
+                                bids[0][0] if bids else None,
+                            )
                             self.evaluate(market_id, data)
                 ws.close()
             except Exception as exc:

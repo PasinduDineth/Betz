@@ -22,11 +22,11 @@ The bot needs a Binance API key/secret and Binance prediction wallet address/ID.
 
 ## Strategy rules
 
-- Only markets whose title/question matches `FOOTBALL_KEYWORDS` are considered.
+- `MARKET_SCOPE=football` considers markets whose title/question matches `FOOTBALL_KEYWORDS`. `MARKET_SCOPE=all` considers every discovered market. All-category live scanning is deliberately restricted to one open position and one order per market.
 - At most one entry order per market and at most `MAX_OPEN_POSITIONS` tracked positions.
 - Entry is triggered by the best ask, not merely the last traded price.
 - Entry price is capped by `ENTRY_MAX_PRICE`; the amount is capped by `BUY_USDT`.
-- Exit is triggered by the best bid reaching `EXIT_MIN_PRICE`.
+- In REST mode, a fresh signed Binance order-book snapshot triggers an entry only when its best ask is at or below `ENTRY_MAX_PRICE`. It triggers an exit only when bid depth at or above `EXIT_MIN_PRICE` covers the filled shares. A price can still move between snapshot and execution, so the order uses a LIMIT cap/floor rather than a market order.
 - Orders use Binance's documented quote-then-place flow. LIMIT orders use GTC.
 - State is persisted in `data/state.json`; logs are written to `logs/trader.log`.
 - If credentials or required market/token fields are missing, the bot logs and skips rather than guessing.
@@ -42,7 +42,7 @@ NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=use-a-long-random-private-topic-name
 ```
 
-The scanner sends alerts for new football markets, entry signals, exit signals, and live order submissions. Public ntfy topics are effectively bearer names, so do not use a short or guessable topic.
+The scanner sends alerts for new in-scope markets, entry signals, exit signals, and live order submissions. Public ntfy topics are effectively bearer names, so do not use a short or guessable topic.
 
 ## Run continuously on Ubuntu
 

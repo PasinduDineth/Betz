@@ -33,29 +33,6 @@ The bot needs a Binance API key/secret and Binance prediction wallet address/ID.
 
 The Binance web market endpoint is not a stable public developer API and its request schema can change. The parser accepts common field names and logs an actionable error when a market cannot be mapped to an outcome token. The request body can be overridden with `BINANCE_MARKETS_BODY_JSON` after inspecting the browser request.
 
-## Read-only BTC 5-minute paired-entry experiment
-
-This experiment tests the idea of buying both sides of a Bitcoin five-minute Up/Down market at a very low price. It sends **no orders**. When `PAPER_BTC_5M_MONITOR=true`, the program refuses to start if `LIVE_TRADING=true` and runs a dedicated read-only monitor instead of the live trader.
-
-Every second it reads the signed Binance order book for the paired Up and Down contracts, then records:
-
-- the real best ask and best bid on both sides;
-- whether a full hypothetical `$2` buy on **each** side could fill at or below `PAPER_ENTRY_MAX_PRICE`;
-- once both paper buys can fully fill, the actual bid-depth proceeds for closing both legs; and
-- combined profit/loss before fees and any shares that cannot be sold at displayed bids.
-
-The monitor writes raw observations to `data/paper_btc_5m.jsonl` and emits compact lines in `logs/trader.log` / systemd journal. It does not prove a strategy: it measures whether the displayed order book would have made the paired entry and exit executable.
-
-To run it, set these values in `.env` and restart the service:
-
-```env
-LIVE_TRADING=false
-PAPER_BTC_5M_MONITOR=true
-PAPER_MONITOR_SECONDS=1
-PAPER_ENTRY_MAX_PRICE=0.02
-PAPER_LEG_USDT=2.00
-```
-
 ## Free mobile alerts
 
 The scanner supports [ntfy](https://ntfy.sh), an open-source push notification system. Install the ntfy app on your phone, subscribe to a long random topic name, and set the same topic in `.env`:

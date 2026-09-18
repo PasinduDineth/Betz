@@ -478,13 +478,8 @@ def outcome_public_price(market: dict[str, Any], token_id: str) -> Decimal | Non
 def btc_five_minute_window(market: dict[str, Any]) -> bool:
     """Identify Binance's timed Bitcoin Up/Down five-minute event records."""
     text = market_text(market)
-    is_btc_up_down = "bitcoin up or down" in text or "btc up or down" in text
-    if not is_btc_up_down:
+    if "bitcoin up or down" not in text:
         return False
-    # Binance's card layout currently abbreviates these as "BTC Up or Down
-    # 5m". Prefer the explicit duration rather than relying on title dates.
-    if re.search(r"\b5\s*(?:m|min|minutes)\b", text):
-        return True
     for start_key, end_key in (("startTime", "endTime"), ("startAt", "endAt")):
         start, end = dec(market.get(start_key)), dec(market.get(end_key))
         if start is not None and end is not None:
@@ -501,30 +496,6 @@ def btc_five_minute_window(market: dict[str, Any]) -> bool:
     start_minutes = int(match.group(1)) * 60 + int(match.group(2))
     end_minutes = int(match.group(3)) * 60 + int(match.group(4))
     return (end_minutes - start_minutes) % (24 * 60) == 5
-
-
-def paper_side_tokens(market: dict[str, Any]) -> list[tuple[str, str]]:
-    """Return Up/Down tokens from either Binance market representation.
-
-    The public feed can expose a pair as two UP/DOWN markets with YES tokens,
-    or as one market whose outcomes are directly named Up and Down.
-    """
-    outcomes = market.get("outcomes") or market.get("tokens") or market.get("outcomeTokens") or []
-    if isinstance(outcomes, dict):
-        outcomes = list(outcomes.values())
-    tokens: list[tuple[str, str]] = []
-    for item in outcomes:
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get("title") or item.get("name") or item.get("outcome") or "").strip().lower()
-        token = item.get("tokenId") or item.get("token_id") or item.get("id")
-        if label in {"up", "down"} and token is not None:
-            tokens.append((label, str(token)))
-    if tokens:
-        return tokens
-    side = str(market.get("title") or market.get("marketTitle") or "").strip().lower()
-    token = outcome_token(market)
-    return [(side, token[0])] if side in {"up", "down"} and token else []
 
 
 class PaperBtcFiveMinuteMonitor:
@@ -561,6 +532,10 @@ class PaperBtcFiveMinuteMonitor:
             raise RuntimeError("PAPER_MARKET_REFRESH_SECONDS must be >= PAPER_MONITOR_SECONDS")
         if self.cfg.paper_max_events < 1:
             raise RuntimeError("PAPER_MAX_EVENTS must be at least 1")
+
+    @staticmethod
+    def side(market: dict[str, Any]) -> str:
+        return str(market.get("title") or market.get("marketTitle") or "").strip().lower()
 
     @staticmethod
     def levels(levels: Any) -> list[tuple[Decimal, Decimal]]:
@@ -609,29 +584,28 @@ class PaperBtcFiveMinuteMonitor:
 
     def refresh_pairs(self) -> None:
         grouped: dict[str, dict[str, dict[str, Any]]] = {}
-        btc_records = 0
         for market in self.markets_client.markets():
             if not btc_five_minute_window(market):
                 continue
-            btc_records += 1
-            market_id = str(market.get("marketId") or market.get("id") or "")
-            # A one-market, two-outcome response may not contain an event ID.
-            # The market ID still groups its Up and Down tokens correctly.
-            event_id = str(market.get("eventId") or market.get("eventSlug") or market_id)
-            if not market_id or not event_id:
+            side = self.side(market)
+            if side not in {"up", "down"}:
                 continue
-            for side, token_id in paper_side_tokens(market):
-                grouped.setdefault(event_id, {})[side] = {
-                    "market_id": market_id,
-                    "token_id": token_id,
-                    "vendor": str(market.get("vendor") or "predict_fun").lower(),
-                    "title": str(market.get("eventTitle") or market.get("title") or event_id),
-                    "publish_at": market_publish_at_ms(market),
-                }
+            token = outcome_token(market)
+            market_id = str(market.get("marketId") or market.get("id") or "")
+            event_id = str(market.get("eventId") or market.get("eventSlug") or "")
+            if not market_id or not event_id or not token:
+                continue
+            grouped.setdefault(event_id, {})[side] = {
+                "market_id": market_id,
+                "token_id": token[0],
+                "vendor": str(market.get("vendor") or "predict_fun").lower(),
+                "title": str(market.get("eventTitle") or market.get("title") or event_id),
+                "publish_at": market_publish_at_ms(market),
+            }
         complete = {event_id: pair for event_id, pair in grouped.items() if {"up", "down"}.issubset(pair)}
         newest = sorted(complete, key=lambda event_id: max(item["publish_at"] for item in complete[event_id].values()), reverse=True)
         self.pairs = {event_id: complete[event_id] for event_id in newest[: self.cfg.paper_max_events]}
-        log.info("PAPER BTC5M discovery btc_records=%s complete_pairs=%s tracking=%s", btc_records, len(complete), ",".join(self.pairs) or "none")
+        log.info("PAPER BTC5M discovery complete_pairs=%s tracking=%s", len(complete), ",".join(self.pairs) or "none")
 
     @staticmethod
     def top(levels: Any, descending: bool) -> tuple[Decimal | None, Decimal | None]:

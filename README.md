@@ -22,10 +22,11 @@ The bot needs a Binance API key/secret and Binance prediction wallet address/ID.
 
 ## Strategy rules
 
-- `MARKET_SCOPE=football` considers markets whose title/question matches `FOOTBALL_KEYWORDS`. `MARKET_SCOPE=all` considers every discovered market. All-category live scanning is deliberately restricted to one open position and one order per market.
+- `MARKET_SCOPE=soccer` records every newly discovered soccer Total Corners and Second Half Result market to `logs/soccer_research.jsonl`. The record includes raw Binance market data, all outcome tokens, public prices, and fresh token-level order books. It sends one phone digest per newly published soccer batch, not one notification per market.
+- In `soccer` scope, only an explicit **Over** Total Corners outcome with a line at or above `SOCCER_MIN_CORNER_LINE` (default `7.5`) is eligible to trade. Second Half Result is research-only.
+- `MAX_LIVE_ENTRIES=1` is persisted in `data/state.json`: after one real buy submission, the bot cannot open another entry after an exit or restart.
 - At most one entry order per market and at most `MAX_OPEN_POSITIONS` tracked positions.
-- Entry is triggered by the best ask, not merely the last traded price.
-- Entry price is capped by `ENTRY_MAX_PRICE`; the amount is capped by `BUY_USDT`.
+- Entry is triggered by the real best ask, not merely the last traded price. The bot also requires enough cumulative ask notional at or below `ENTRY_MAX_PRICE` to fill the entire `BUY_USDT` amount.
 - In REST mode, a fresh signed Binance order-book snapshot triggers an entry only when its best ask is at or below `ENTRY_MAX_PRICE`. It triggers an exit only when bid depth at or above `EXIT_MIN_PRICE` covers the filled shares. A price can still move between snapshot and execution, so the order uses a LIMIT cap/floor rather than a market order.
 - Orders use Binance's documented quote-then-place flow. LIMIT orders use GTC.
 - State is persisted in `data/state.json`; logs are written to `logs/trader.log`.
@@ -42,7 +43,9 @@ NTFY_SERVER=https://ntfy.sh
 NTFY_TOPIC=use-a-long-random-private-topic-name
 ```
 
-The scanner sends alerts for new in-scope markets, entry signals, exit signals, and live order submissions. Public ntfy topics are effectively bearer names, so do not use a short or guessable topic.
+The scanner sends alerts for discovery digests and real order lifecycle events. Public ntfy topics are effectively bearer names, so do not use a short or guessable topic.
+
+In `MARKET_SCOPE=soccer`, the research logs remain detailed but phone notifications are intentionally limited to one new-soccer digest per discovery batch, real order submission/fill, and the final close with gross P/L.
 
 ## Run continuously on Ubuntu
 

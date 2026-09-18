@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import threading
 import time
@@ -139,6 +140,8 @@ class Config:
     funding_source: str = os.getenv("FUNDING_SOURCE", "MPC")
     orderbook_topic_mode: str = os.getenv("ORDERBOOK_TOPIC_MODE", "rest").strip().lower()
     market_scope: str = os.getenv("MARKET_SCOPE", "football").strip().lower()
+    soccer_min_corner_line: Decimal = env_decimal("SOCCER_MIN_CORNER_LINE", "7.5")
+    max_live_entries: int = int(os.getenv("MAX_LIVE_ENTRIES", "1"))
     # Keep the first connection small and observable. Set to 0 to subscribe
     # to every discovered market, or raise it after confirming snapshots work.
     max_markets_per_connection: int = int(os.getenv("MAX_MARKETS_PER_CONNECTION", "1"))
@@ -171,6 +174,7 @@ class State:
         self.market_baseline_ready = False
         self.market_baseline_scope = ""
         self.market_baseline_started_at_ms = 0
+        self.live_entries_submitted = 0
         self.positions: dict[str, Position] = {}
         self.orders_per_market: dict[str, int] = {}
         self.lock = threading.Lock()
@@ -185,6 +189,7 @@ class State:
             self.market_baseline_ready = bool(raw.get("market_baseline_ready", False))
             self.market_baseline_scope = str(raw.get("market_baseline_scope", ""))
             self.market_baseline_started_at_ms = int(raw.get("market_baseline_started_at_ms", 0) or 0)
+            self.live_entries_submitted = int(raw.get("live_entries_submitted", 0) or 0)
             self.orders_per_market = {str(k): int(v) for k, v in raw.get("orders_per_market", {}).items()}
             self.positions = {k: Position(**v) for k, v in raw.get("positions", {}).items()}
         except Exception as exc:
@@ -197,6 +202,7 @@ class State:
                 "market_baseline_ready": self.market_baseline_ready,
                 "market_baseline_scope": self.market_baseline_scope,
                 "market_baseline_started_at_ms": self.market_baseline_started_at_ms,
+                "live_entries_submitted": self.live_entries_submitted,
                 "orders_per_market": self.orders_per_market,
                 "positions": {k: asdict(v) for k, v in self.positions.items()},
             }
@@ -412,7 +418,7 @@ class BinanceMarketClient:
 def market_text(market: dict[str, Any]) -> str:
     return " ".join(
         str(market.get(k, ""))
-        for k in ("title", "question", "description", "slug", "eventTitle", "eventSlug", "eventName")
+        for k in ("title", "marketTitle", "question", "description", "slug", "eventTitle", "eventSlug", "eventName", "outcomeName")
     ).lower()
 
 
@@ -420,6 +426,13 @@ def market_is_in_scope(market: dict[str, Any], cfg: Config) -> bool:
     """Apply the intentionally narrow discovery scope configured by the user."""
     if cfg.market_scope == "all":
         return True
+    if cfg.market_scope == "soccer":
+        category_text = " ".join(
+            str(market.get(key, ""))
+            for key in ("l1Category", "l2Category", "category", "sport", "sportType", "eventCategory")
+        ).lower()
+        text = f"{category_text} {market_text(market)}"
+        return "soccer" in text and "american football" not in text
     return any(keyword in market_text(market) for keyword in cfg.football_keywords)
 
 
@@ -433,23 +446,47 @@ def market_is_newer_than_baseline(market: dict[str, Any], baseline_started_at_ms
     return market_publish_at_ms(market) > baseline_started_at_ms
 
 
-def outcome_token(market: dict[str, Any]) -> tuple[str, str] | None:
+def outcome_tokens(market: dict[str, Any]) -> list[tuple[str, str]]:
     outcomes = market.get("outcomes") or market.get("tokens") or market.get("outcomeTokens") or []
     if isinstance(outcomes, dict):
         outcomes = list(outcomes.values())
+    parsed: list[tuple[str, str]] = []
     for item in outcomes:
-        if isinstance(item, str):
+        if not isinstance(item, dict):
             continue
         label = str(item.get("title") or item.get("name") or item.get("outcome") or "")
         token = item.get("tokenId") or item.get("token_id") or item.get("id")
-        if token is not None and label.lower() in {"yes", "no", "over", "under"}:
-            return str(token), label
-    if outcomes and isinstance(outcomes[0], dict):
-        item = outcomes[0]
-        token = item.get("tokenId") or item.get("token_id") or item.get("id")
         if token is not None:
-            return str(token), str(item.get("title") or item.get("name") or "outcome")
-    return None
+            parsed.append((str(token), label))
+    return parsed
+
+
+def outcome_token(market: dict[str, Any]) -> tuple[str, str] | None:
+    """Backward-compatible primary outcome selection for generic scopes."""
+    tokens = outcome_tokens(market)
+    for token, label in tokens:
+        if label.lower() in {"yes", "no", "over", "under"}:
+            return token, label
+    return tokens[0] if tokens else None
+
+
+def market_kind(market: dict[str, Any]) -> str:
+    text = market_text(market)
+    if "total corners" in text:
+        return "total_corners"
+    if "second half result" in text:
+        return "second_half_result"
+    return "other"
+
+
+def corner_line(market: dict[str, Any]) -> Decimal | None:
+    match = re.search(r"(?:o/u|over\s*[/ ]?under)\s*(\d+(?:\.\d+)?)", market_text(market))
+    return dec(match.group(1)) if match else None
+
+
+def is_over_outcome(market: dict[str, Any], label: str) -> bool:
+    """Only trade an explicit Over outcome; never infer an unknown side."""
+    return label.strip().lower().startswith("over") or str(market.get("title") or "").strip().lower().startswith("over")
 
 
 def outcome_public_price(market: dict[str, Any], token_id: str) -> Decimal | None:
@@ -480,6 +517,7 @@ class LiveTrader:
         self.subscribed_topics: set[str] = set()
         self.last_error_notification = 0.0
         self.startup_price_checked = False
+        self.soccer_research_path = LOG_DIR / "soccer_research.jsonl"
         if self.state.prepare_discovery_scope(cfg.market_scope):
             log.warning("Discovery scope changed to %s; establishing a no-trade baseline", cfg.market_scope)
 
@@ -499,8 +537,8 @@ class LiveTrader:
             raise RuntimeError("ENTRY_MAX_PRICE must be between 0 and 1")
         if not (self.cfg.entry_max < self.cfg.exit_min <= Decimal("1")):
             raise RuntimeError("EXIT_MIN_PRICE must be greater than ENTRY_MAX_PRICE and <= 1")
-        if self.cfg.market_scope not in {"football", "all"}:
-            raise RuntimeError("MARKET_SCOPE must be football or all")
+        if self.cfg.market_scope not in {"football", "soccer", "all"}:
+            raise RuntimeError("MARKET_SCOPE must be football, soccer, or all")
         if self.cfg.market_scope == "all" and self.cfg.live:
             if self.cfg.max_positions != 1 or self.cfg.max_per_market != 1:
                 raise RuntimeError("All-category live scanning requires MAX_OPEN_POSITIONS=1 and MAX_ORDERS_PER_MARKET=1")
@@ -510,11 +548,45 @@ class LiveTrader:
             raise RuntimeError("WS_PING_SECONDS must be greater than 0 and less than 30")
         if self.cfg.ws_recv_timeout <= 0:
             raise RuntimeError("WS_RECV_TIMEOUT_SECONDS must be greater than 0")
+        if self.cfg.soccer_min_corner_line < Decimal("7.5"):
+            raise RuntimeError("SOCCER_MIN_CORNER_LINE must be at least 7.5")
+        if self.cfg.max_live_entries != 1:
+            raise RuntimeError("MAX_LIVE_ENTRIES must be exactly 1 for this bot")
+
+    def log_soccer_research(self, market_id: str, market: dict[str, Any], kind: str, tokens: list[tuple[str, str]], is_new: bool) -> None:
+        """Persist every discovered research market with its raw token books."""
+        if not is_new or kind not in {"total_corners", "second_half_result"}:
+            return
+        outcomes: list[dict[str, Any]] = []
+        for token_id, label in tokens:
+            item: dict[str, Any] = {"token_id": token_id, "label": label, "public_price": str(outcome_public_price(market, token_id) or "")}
+            if self.cfg.binance_key and self.cfg.binance_secret:
+                try:
+                    book = self.binance.order_book(market_id, token_id, str(market.get("vendor") or "predict_fun").lower())
+                    item["order_book"] = book
+                except Exception as exc:
+                    item["order_book_error"] = str(exc)
+            outcomes.append(item)
+        record = {
+            "timestamp_ms": int(time.time() * 1000),
+            "market_id": market_id,
+            "event_id": market.get("eventId"),
+            "event_slug": market.get("eventSlug"),
+            "event_title": market.get("eventTitle"),
+            "kind": kind,
+            "corner_line": str(corner_line(market) or ""),
+            "outcomes": outcomes,
+            "raw_market": market,
+        }
+        with self.soccer_research_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, default=str, separators=(",", ":")) + "\n")
+        log.info("SOCCER RESEARCH kind=%s market=%s event=%s outcomes=%s detail_log=%s", kind, market_id, market.get("eventTitle") or market.get("title"), len(outcomes), self.soccer_research_path)
 
     def discover_loop(self) -> None:
         while not self.stop.is_set():
             try:
                 new_markets: list[str] = []
+                new_soccer_events: dict[str, set[str]] = {}
                 current_candidates: list[str] = []
                 is_bootstrap = not self.state.market_baseline_ready
                 for market in self.markets_client.markets():
@@ -529,26 +601,39 @@ class LiveTrader:
                         and market_is_newer_than_baseline(market, self.state.market_baseline_started_at_ms)
                     )
                     detail = market
-                    token = outcome_token(detail)
-                    if not token:
+                    kind = market_kind(detail)
+                    tokens = outcome_tokens(detail)
+                    if not tokens:
                         log.warning("New in-scope market %s has no recognizable outcome token; skipped: %s", market_id, market_text(detail)[:160])
                         continue
+                    self.log_soccer_research(market_id, detail, kind, tokens, is_new)
+                    trade_token: tuple[str, str] | None = outcome_token(detail)
+                    trade_eligible = True
+                    if self.cfg.market_scope == "soccer":
+                        line = corner_line(detail)
+                        trade_token = next(
+                            ((token_id, label) for token_id, label in tokens if is_over_outcome(detail, label)),
+                            None,
+                        )
+                        trade_eligible = kind == "total_corners" and line is not None and line >= self.cfg.soccer_min_corner_line and trade_token is not None
                     self.state.seen.add(market_id)
-                    public_price = outcome_public_price(detail, token[0])
+                    public_price = outcome_public_price(detail, trade_token[0]) if trade_token else None
                     self.market_meta[market_id] = {
                         "market": detail,
-                        "token_id": token[0],
-                        "outcome": token[1],
+                        "token_id": trade_token[0] if trade_token else "",
+                        "outcome": trade_token[1] if trade_token else "",
                         "vendor": str(detail.get("vendor") or "predict_fun").lower(),
                         "public_price": str(public_price) if public_price is not None else "",
+                        "trade_eligible": trade_eligible,
+                        "kind": kind,
                     }
                     current_candidates.append(market_id)
-                    if self.cfg.orderbook_topic_mode == "rest":
+                    if self.cfg.orderbook_topic_mode == "rest" and trade_eligible:
                         self.evaluate_rest_order_book(market_id, eligible_for_entry)
                     if self.cfg.orderbook_topic_mode == "dynamic" and market_id not in self.subscribed_topics:
                         self.topic_queue.put(market_id)
                         self.subscribed_topics.add(market_id)
-                        log.info("TRACKING in-scope market id=%s outcome=%s", market_id, token[1])
+                        log.info("TRACKING in-scope market id=%s outcome=%s", market_id, trade_token[1] if trade_token else None)
                     if is_bootstrap:
                         continue
                     if not is_new:
@@ -565,13 +650,16 @@ class LiveTrader:
                     log.info(
                         "NEW MARKET scope=%s eligible=%s id=%s outcome=%s token=%s title=%s",
                         self.cfg.market_scope,
-                        eligible_for_entry,
+                        eligible_for_entry and trade_eligible,
                         market_id,
-                        token[1],
-                        token[0],
+                        trade_token[1] if trade_token else None,
+                        trade_token[0] if trade_token else None,
                         title,
                     )
-                    new_markets.append(f"{title} | {token[1]} | price={public_price} | id={market_id}")
+                    new_markets.append(f"{title} | {trade_token[1] if trade_token else 'research only'} | price={public_price} | id={market_id}")
+                    if self.cfg.market_scope == "soccer" and kind in {"total_corners", "second_half_result"} and market_is_newer_than_baseline(detail, self.state.market_baseline_started_at_ms):
+                        event_key = str(detail.get("eventId") or detail.get("eventSlug") or detail.get("eventTitle") or title)
+                        new_soccer_events.setdefault(event_key, set()).add(kind)
                     if self.cfg.orderbook_topic_mode == "rest":
                         self.log_public_market_price(market_id, "new market discovery")
                 if not self.startup_price_checked and current_candidates:
@@ -592,7 +680,15 @@ class LiveTrader:
                     for position in list(self.state.positions.values()):
                         if position.status == "FILLED":
                             self.evaluate_rest_exit(position)
-                if new_markets:
+                if self.cfg.market_scope == "soccer" and new_soccer_events:
+                    corners = sum("total_corners" in kinds for kinds in new_soccer_events.values())
+                    second_half = sum("second_half_result" in kinds for kinds in new_soccer_events.values())
+                    self.notifier.send(
+                        "New soccer items added",
+                        f"Matches: {len(new_soccer_events)}\nTotal Corners: {corners}\nSecond Half Result: {second_half}\nFull details: {self.soccer_research_path.name}",
+                        tags="soccer",
+                    )
+                elif new_markets and self.cfg.market_scope != "soccer":
                     # A market-list refresh can contain many new markets. Send
                     # one digest so ntfy is not flooded and rate-limited.
                     shown = new_markets[:20]
@@ -658,10 +754,27 @@ class LiveTrader:
                 total += size
         return total
 
+    @staticmethod
+    def buy_notional_at_or_below(levels: Any, ceiling: Decimal) -> Decimal:
+        """Sum executable USDT across ask levels without exceeding a buy cap."""
+        if not isinstance(levels, list):
+            return Decimal("0")
+        total = Decimal("0")
+        for level in levels:
+            if isinstance(level, dict):
+                price, size = dec(level.get("price")), dec(level.get("size"))
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                price, size = dec(level[0]), dec(level[1])
+            else:
+                continue
+            if price is not None and size is not None and Decimal("0") < price <= ceiling and size > 0:
+                total += price * size
+        return total
+
     def evaluate_rest_order_book(self, market_id: str, is_new: bool) -> None:
         """Use Binance's signed REST book for new-entry execution checks."""
         meta = self.market_meta.get(market_id)
-        if not meta:
+        if not meta or not meta.get("trade_eligible"):
             return
         if not is_new:
             return
@@ -671,8 +784,9 @@ class LiveTrader:
             if best_ask is None:
                 return
             ask_price, ask_size = best_ask
-            if ask_price <= self.cfg.entry_max and ask_size > 0:
-                log.warning("ENTRY SIGNAL best_ask=%s size=%s market=%s limit=%s", ask_price, ask_size, market_id, self.cfg.entry_max)
+            executable_notional = self.buy_notional_at_or_below(book.get("asks"), self.cfg.entry_max)
+            if ask_price <= self.cfg.entry_max and executable_notional >= self.cfg.buy_usdt:
+                log.warning("ENTRY SIGNAL best_ask=%s top_size=%s executable_usdt=%s market=%s limit=%s", ask_price, ask_size, executable_notional, market_id, self.cfg.entry_max)
                 self.try_buy(market_id, meta, ask_price)
         except Exception as exc:
             log.warning("REST order-book entry check failed market=%s: %s", market_id, exc)
@@ -841,18 +955,17 @@ class LiveTrader:
             self.try_sell(market_id, position, best_bid)
 
     def try_buy(self, market_id: str, meta: dict[str, Any], price: Decimal) -> None:
+        if not meta.get("trade_eligible", True):
+            return
         if self.state.orders_per_market.get(market_id, 0) >= self.cfg.max_per_market:
+            return
+        if self.cfg.live and self.state.live_entries_submitted >= self.cfg.max_live_entries:
+            log.info("Live-entry cap reached (%s); ignoring market=%s", self.cfg.max_live_entries, market_id)
             return
         if len([p for p in self.state.positions.values() if p.status in {"BUY_PENDING", "FILLED", "SELL_PENDING"}]) >= self.cfg.max_positions:
             return
         if not self.cfg.live:
             log.warning("SIGNAL ONLY live=false BUY market=%s token=%s price=%s amount=%s", market_id, meta["token_id"], price, self.cfg.buy_usdt)
-            self.notifier.send(
-                "Binance entry signal",
-                f"Market: {meta['market'].get('title') or meta['market'].get('question') or market_id}\nAsk: {price}\nAmount: {self.cfg.buy_usdt} USDT",
-                priority="high",
-                tags="chart_with_upwards_trend",
-            )
             return
         try:
             quote = self.binance.get_quote(meta["token_id"], "BUY", self.cfg.buy_usdt, price, self.cfg.entry_slippage)
@@ -861,16 +974,17 @@ class LiveTrader:
             self.state.positions[market_id] = Position(
                 market_id,
                 meta["token_id"],
-                str(meta["market"].get("title") or meta["market"].get("question") or market_id),
+                str(meta["market"].get("eventTitle") or meta["market"].get("title") or meta["market"].get("question") or market_id),
                 buy_order_id=order_id,
                 buy_price=str(price),
                 created_at=now,
                 updated_at=now,
             )
             self.state.orders_per_market[market_id] = self.state.orders_per_market.get(market_id, 0) + 1
+            self.state.live_entries_submitted += 1
             self.state.save()
             log.warning("LIVE BUY submitted market=%s order=%s price=%s amount=%s", market_id, order_id, price, self.cfg.buy_usdt)
-            self.notifier.send("LIVE BUY submitted", f"Market: {market_id}\nPrice: {price}\nAmount: {self.cfg.buy_usdt} USDT", priority="high", tags="moneybag")
+            self.notifier.send("Live soccer order submitted", f"Market: {meta['market'].get('eventTitle') or meta['market'].get('title') or market_id}\nOutcome: {meta['outcome']}\nLimit: {price}\nAmount: {self.cfg.buy_usdt} USDT\nOrder: {order_id}", priority="high", tags="moneybag")
         except Exception as exc:
             log.exception("BUY failed market=%s: %s", market_id, exc)
 
@@ -880,7 +994,6 @@ class LiveTrader:
             return
         if not self.cfg.live:
             log.warning("SIGNAL ONLY live=false SELL market=%s price=%s shares=%s", market_id, price, shares)
-            self.notifier.send("Binance exit signal", f"Market: {market_id}\nBid: {price}\nShares: {shares}", priority="high", tags="moneybag")
             return
         try:
             quote = self.binance.get_quote(position.token_id, "SELL", shares, price, self.cfg.exit_slippage)
@@ -893,6 +1006,33 @@ class LiveTrader:
             self.notifier.send("LIVE SELL submitted", f"Market: {market_id}\nPrice: {price}\nShares: {shares}", priority="high", tags="moneybag")
         except Exception as exc:
             log.exception("SELL failed market=%s: %s", market_id, exc)
+
+    @staticmethod
+    def filled_usdt_amount(order: dict[str, Any]) -> Decimal | None:
+        for key in ("filledUsdtAmount", "filledAmount", "makerUsdtAmount", "amount"):
+            value = dec(order.get(key))
+            if value is not None and value > 0:
+                return value
+        return None
+
+    def notify_closed_position(self, market_id: str, position: Position) -> None:
+        """Send a single closure notification with actual historical amounts."""
+        try:
+            history = self.binance.order_history(market_id)
+            by_id = {str(item.get("orderId", "")): item for item in history}
+            bought = self.filled_usdt_amount(by_id.get(position.buy_order_id, {}))
+            sold = self.filled_usdt_amount(by_id.get(position.sell_order_id, {}))
+            if bought is not None and sold is not None:
+                pnl = sold - bought
+                roi = (pnl / bought * Decimal("100")) if bought else Decimal("0")
+                detail = f"Buy: {bought} USDT\nSell: {sold} USDT\nGross P/L: {pnl:.8f} USDT ({roi:.2f}%)"
+            else:
+                detail = "Historical fill amounts were unavailable; check Binance Order History."
+            log.warning("LIVE SELL closed market=%s order=%s %s", market_id, position.sell_order_id, detail.replace("\n", " | "))
+            self.notifier.send("Live soccer position closed", f"Market: {position.title}\nShares: {position.filled_shares}\n{detail}", priority="high", tags="white_check_mark")
+        except Exception as exc:
+            log.warning("Could not calculate closure P/L market=%s: %s", market_id, exc)
+            self.notifier.send("Live soccer position closed", f"Market: {position.title}\nShares: {position.filled_shares}\nCheck Binance Order History for final P/L.", priority="high", tags="white_check_mark")
 
     def reconcile_loop(self) -> None:
         while not self.stop.is_set():
@@ -931,8 +1071,8 @@ class LiveTrader:
                                 position.status = "FILLED"
                                 position.updated_at = time.time()
                                 self.notifier.send(
-                                    "LIVE BUY filled",
-                                    f"Market: {market_id}\nShares: {onchain_shares}\nEntry limit: {position.buy_price}",
+                                    "Live soccer order filled",
+                                    f"Market: {position.title}\nShares: {onchain_shares}\nEntry limit: {position.buy_price}\nOrder: {position.buy_order_id}",
                                     priority="high",
                                     tags="white_check_mark",
                                 )
@@ -947,8 +1087,7 @@ class LiveTrader:
                             if onchain_shares <= 0 and position.sell_order_id not in active_ids:
                                 position.status = "CLOSED"
                                 position.updated_at = time.time()
-                                log.warning("LIVE SELL closed market=%s order=%s", market_id, position.sell_order_id)
-                                self.notifier.send("LIVE SELL filled", f"Market: {market_id}\nOrder: {position.sell_order_id}", priority="high", tags="white_check_mark")
+                                self.notify_closed_position(market_id, position)
                             elif time.time() - position.updated_at > self.cfg.stale_seconds and position.sell_order_id in active_ids:
                                 if self.binance.cancel_order(position.sell_order_id):
                                     position.sell_order_id = ""

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import threading
 import time
@@ -144,6 +145,14 @@ class Config:
     max_markets_per_connection: int = int(os.getenv("MAX_MARKETS_PER_CONNECTION", "1"))
     ws_ping_seconds: float = float(os.getenv("WS_PING_SECONDS", "25"))
     ws_recv_timeout: float = float(os.getenv("WS_RECV_TIMEOUT_SECONDS", "5"))
+    # Paper-only research mode. This deliberately uses a separate runner so
+    # none of the live quote/place/cancel code paths are reachable.
+    paper_btc_5m_monitor: bool = os.getenv("PAPER_BTC_5M_MONITOR", "false").lower() == "true"
+    paper_monitor_seconds: float = float(os.getenv("PAPER_MONITOR_SECONDS", "1"))
+    paper_market_refresh_seconds: float = float(os.getenv("PAPER_MARKET_REFRESH_SECONDS", "10"))
+    paper_entry_max: Decimal = env_decimal("PAPER_ENTRY_MAX_PRICE", "0.02")
+    paper_leg_usdt: Decimal = env_decimal("PAPER_LEG_USDT", "2.00")
+    paper_max_events: int = int(os.getenv("PAPER_MAX_EVENTS", "1"))
 
     @property
     def football_keywords(self) -> tuple[str, ...]:
@@ -464,6 +473,215 @@ def outcome_public_price(market: dict[str, Any], token_id: str) -> Decimal | Non
         if str(item_token) == token_id:
             return dec(item.get("price"))
     return None
+
+
+def btc_five_minute_window(market: dict[str, Any]) -> bool:
+    """Identify Binance's timed Bitcoin Up/Down five-minute event records."""
+    text = market_text(market)
+    if "bitcoin up or down" not in text:
+        return False
+    for start_key, end_key in (("startTime", "endTime"), ("startAt", "endAt")):
+        start, end = dec(market.get(start_key)), dec(market.get(end_key))
+        if start is not None and end is not None:
+            duration = end - start
+            if duration > Decimal("1000000"):
+                duration /= Decimal("1000")
+            return Decimal("295") <= duration <= Decimal("305")
+    # The public feed title currently uses ranges such as "7:05PM-7:10PM".
+    # Keep this fallback narrow; do not treat a 15-minute or hourly contract
+    # as a five-minute one just because it contains the word Bitcoin.
+    match = re.search(r"(\d{1,2}):(\d{2})\s*(?:am|pm)?\s*[-–]\s*(\d{1,2}):(\d{2})", text)
+    if not match:
+        return False
+    start_minutes = int(match.group(1)) * 60 + int(match.group(2))
+    end_minutes = int(match.group(3)) * 60 + int(match.group(4))
+    return (end_minutes - start_minutes) % (24 * 60) == 5
+
+
+class PaperBtcFiveMinuteMonitor:
+    """Read-only paired-entry experiment for BTC five-minute Up/Down markets.
+
+    This class intentionally has no references to Binance's quote, place,
+    cancel, position, or order-history methods. It only reads order books and
+    simulates whether two $2 limit buys could fully fill, then what those
+    shares could actually sell for at the displayed bids.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.markets_client = BinanceMarketClient(cfg)
+        self.binance = BinanceClient(cfg)
+        self.stop = threading.Event()
+        self.last_market_refresh = 0.0
+        self.pairs: dict[str, dict[str, dict[str, Any]]] = {}
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.record_path = DATA_DIR / "paper_btc_5m.jsonl"
+
+    def validate(self) -> None:
+        if self.cfg.live:
+            raise RuntimeError("Paper BTC monitor requires LIVE_TRADING=false; it will not run alongside live trading")
+        if not self.cfg.binance_key or not self.cfg.binance_secret:
+            raise RuntimeError("Paper BTC monitor requires BINANCE_API_KEY and BINANCE_API_SECRET to read signed order books")
+        if not (Decimal("0") < self.cfg.paper_entry_max < Decimal("1")):
+            raise RuntimeError("PAPER_ENTRY_MAX_PRICE must be between 0 and 1")
+        if self.cfg.paper_leg_usdt <= 0:
+            raise RuntimeError("PAPER_LEG_USDT must be greater than 0")
+        if self.cfg.paper_monitor_seconds < 1:
+            raise RuntimeError("PAPER_MONITOR_SECONDS must be at least 1 to avoid excessive order-book polling")
+        if self.cfg.paper_market_refresh_seconds < self.cfg.paper_monitor_seconds:
+            raise RuntimeError("PAPER_MARKET_REFRESH_SECONDS must be >= PAPER_MONITOR_SECONDS")
+        if self.cfg.paper_max_events < 1:
+            raise RuntimeError("PAPER_MAX_EVENTS must be at least 1")
+
+    @staticmethod
+    def side(market: dict[str, Any]) -> str:
+        return str(market.get("title") or market.get("marketTitle") or "").strip().lower()
+
+    @staticmethod
+    def levels(levels: Any) -> list[tuple[Decimal, Decimal]]:
+        result: list[tuple[Decimal, Decimal]] = []
+        if not isinstance(levels, list):
+            return result
+        for level in levels:
+            if isinstance(level, dict):
+                price, size = dec(level.get("price")), dec(level.get("size"))
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                price, size = dec(level[0]), dec(level[1])
+            else:
+                continue
+            if price is not None and size is not None and price > 0 and size > 0:
+                result.append((price, size))
+        return result
+
+    @classmethod
+    def simulated_buy(cls, asks: Any, budget: Decimal, limit: Decimal) -> dict[str, Decimal | bool]:
+        """Fill a paper buy across actual ask levels at or below the limit."""
+        remaining = budget
+        shares = Decimal("0")
+        for price, available in sorted(cls.levels(asks), key=lambda level: level[0]):
+            if price > limit:
+                break
+            quantity = min(available, remaining / price)
+            shares += quantity
+            remaining -= quantity * price
+            if remaining <= Decimal("0.00000001"):
+                break
+        spent = budget - max(remaining, Decimal("0"))
+        return {"filled": remaining <= Decimal("0.00000001"), "spent": spent, "shares": shares}
+
+    @classmethod
+    def simulated_sell(cls, bids: Any, shares: Decimal) -> dict[str, Decimal | bool]:
+        """Sell paper shares into the current displayed bid depth."""
+        remaining = shares
+        proceeds = Decimal("0")
+        for price, available in sorted(cls.levels(bids), key=lambda level: level[0], reverse=True):
+            quantity = min(available, remaining)
+            proceeds += quantity * price
+            remaining -= quantity
+            if remaining <= Decimal("0.00000001"):
+                break
+        return {"filled": remaining <= Decimal("0.00000001"), "proceeds": proceeds, "unfilled_shares": max(remaining, Decimal("0"))}
+
+    def refresh_pairs(self) -> None:
+        grouped: dict[str, dict[str, dict[str, Any]]] = {}
+        for market in self.markets_client.markets():
+            if not btc_five_minute_window(market):
+                continue
+            side = self.side(market)
+            if side not in {"up", "down"}:
+                continue
+            token = outcome_token(market)
+            market_id = str(market.get("marketId") or market.get("id") or "")
+            event_id = str(market.get("eventId") or market.get("eventSlug") or "")
+            if not market_id or not event_id or not token:
+                continue
+            grouped.setdefault(event_id, {})[side] = {
+                "market_id": market_id,
+                "token_id": token[0],
+                "vendor": str(market.get("vendor") or "predict_fun").lower(),
+                "title": str(market.get("eventTitle") or market.get("title") or event_id),
+                "publish_at": market_publish_at_ms(market),
+            }
+        complete = {event_id: pair for event_id, pair in grouped.items() if {"up", "down"}.issubset(pair)}
+        newest = sorted(complete, key=lambda event_id: max(item["publish_at"] for item in complete[event_id].values()), reverse=True)
+        self.pairs = {event_id: complete[event_id] for event_id in newest[: self.cfg.paper_max_events]}
+        log.info("PAPER BTC5M discovery complete_pairs=%s tracking=%s", len(complete), ",".join(self.pairs) or "none")
+
+    @staticmethod
+    def top(levels: Any, descending: bool) -> tuple[Decimal | None, Decimal | None]:
+        parsed = sorted(PaperBtcFiveMinuteMonitor.levels(levels), key=lambda level: level[0], reverse=descending)
+        return parsed[0] if parsed else (None, None)
+
+    @staticmethod
+    def serialize(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, dict):
+            return {key: PaperBtcFiveMinuteMonitor.serialize(item) for key, item in value.items()}
+        return value
+
+    def write_record(self, record: dict[str, Any]) -> None:
+        with self.record_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self.serialize(record), separators=(",", ":")) + "\n")
+
+    def inspect_pair(self, event_id: str, pair: dict[str, dict[str, Any]]) -> None:
+        try:
+            books = {
+                side: self.binance.order_book(meta["market_id"], meta["token_id"], meta["vendor"])
+                for side, meta in pair.items()
+            }
+        except Exception as exc:
+            log.warning("PAPER BTC5M book read failed event=%s: %s", event_id, exc)
+            return
+        snapshot: dict[str, Any] = {"timestamp_ms": int(time.time() * 1000), "event_id": event_id, "title": pair["up"]["title"], "sides": {}}
+        buys: dict[str, dict[str, Decimal | bool]] = {}
+        for side in ("up", "down"):
+            ask_price, ask_size = self.top(books[side].get("asks"), descending=False)
+            bid_price, bid_size = self.top(books[side].get("bids"), descending=True)
+            buys[side] = self.simulated_buy(books[side].get("asks"), self.cfg.paper_leg_usdt, self.cfg.paper_entry_max)
+            snapshot["sides"][side] = {
+                "best_ask": ask_price, "best_ask_shares": ask_size,
+                "best_bid": bid_price, "best_bid_shares": bid_size,
+                "paper_buy": buys[side],
+            }
+        entry = self.entries.get(event_id)
+        if entry is None and bool(buys["up"]["filled"]) and bool(buys["down"]["filled"]):
+            entry = {"up_shares": buys["up"]["shares"], "down_shares": buys["down"]["shares"], "cost": buys["up"]["spent"] + buys["down"]["spent"], "entered_at_ms": snapshot["timestamp_ms"]}
+            self.entries[event_id] = entry
+            log.warning("PAPER BTC5M PAIRED ENTRY event=%s up_shares=%s down_shares=%s total_cost=%s", event_id, entry["up_shares"], entry["down_shares"], entry["cost"])
+        if entry is not None:
+            up_sell = self.simulated_sell(books["up"].get("bids"), entry["up_shares"])
+            down_sell = self.simulated_sell(books["down"].get("bids"), entry["down_shares"])
+            combined_proceeds = up_sell["proceeds"] + down_sell["proceeds"]
+            snapshot["paper_position"] = {
+                **entry,
+                "up_sell": up_sell,
+                "down_sell": down_sell,
+                "combined_proceeds": combined_proceeds,
+                "combined_pnl_before_fees": combined_proceeds - entry["cost"],
+            }
+            log.warning("PAPER BTC5M TRACK event=%s up ask=%s bid=%s close=%s filled=%s down ask=%s bid=%s close=%s filled=%s close_both=%s pnl_before_fees=%s", event_id, snapshot["sides"]["up"]["best_ask"], snapshot["sides"]["up"]["best_bid"], up_sell["proceeds"], up_sell["filled"], snapshot["sides"]["down"]["best_ask"], snapshot["sides"]["down"]["best_bid"], down_sell["proceeds"], down_sell["filled"], combined_proceeds, combined_proceeds - entry["cost"])
+        else:
+            log.info("PAPER BTC5M WATCH event=%s up ask=%s bid=%s fill<=%s=%s down ask=%s bid=%s fill<=%s=%s", event_id, snapshot["sides"]["up"]["best_ask"], snapshot["sides"]["up"]["best_bid"], self.cfg.paper_entry_max, buys["up"]["filled"], snapshot["sides"]["down"]["best_ask"], snapshot["sides"]["down"]["best_bid"], self.cfg.paper_entry_max, buys["down"]["filled"])
+        self.write_record(snapshot)
+
+    def run(self) -> None:
+        self.validate()
+        log.warning("PAPER BTC5M START no orders possible leg_usdt=%s entry<=%s poll_seconds=%s", self.cfg.paper_leg_usdt, self.cfg.paper_entry_max, self.cfg.paper_monitor_seconds)
+        try:
+            while not self.stop.is_set():
+                now = time.monotonic()
+                if now - self.last_market_refresh >= self.cfg.paper_market_refresh_seconds:
+                    self.refresh_pairs()
+                    self.last_market_refresh = now
+                for event_id, pair in self.pairs.items():
+                    self.inspect_pair(event_id, pair)
+                self.stop.wait(self.cfg.paper_monitor_seconds)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop.set()
+            log.warning("PAPER BTC5M STOPPED records=%s", self.record_path)
 
 
 class LiveTrader:
@@ -988,10 +1206,12 @@ class LiveTrader:
 
 
 def main() -> None:
-    trader = LiveTrader(Config())
-    signal.signal(signal.SIGINT, lambda *_: trader.stop.set())
-    signal.signal(signal.SIGTERM, lambda *_: trader.stop.set())
-    trader.run()
+    cfg = Config()
+    runner: PaperBtcFiveMinuteMonitor | LiveTrader
+    runner = PaperBtcFiveMinuteMonitor(cfg) if cfg.paper_btc_5m_monitor else LiveTrader(cfg)
+    signal.signal(signal.SIGINT, lambda *_: runner.stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: runner.stop.set())
+    runner.run()
 
 
 if __name__ == "__main__":

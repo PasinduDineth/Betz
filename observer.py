@@ -1,8 +1,9 @@
 """Read-only Binance Prediction Market anomaly observer.
 
 This program deliberately contains no quote, order placement, cancellation, or
-position APIs. It samples a market only when it is first discovered with a
-real, executable $0.01/$0.02 ask, then records that market for ten minutes.
+position APIs. It logs the initial executable ask for every later-added market,
+watches it in memory for ten minutes, and writes detailed snapshots only if a
+real, executable $0.01/$0.02 ask appears during that window.
 """
 
 from __future__ import annotations
@@ -234,14 +235,17 @@ class ReadOnlyBinance:
 
 
 @dataclass
-class Capture:
+class Watch:
     market_id: str
     template: str
     started_at: float
     ends_at: float
-    path: str
     market: dict[str, Any]
     tokens: list[tuple[str, str]]
+    initial_books: dict[str, dict[str, Any]]
+    lowest_asks: dict[str, Decimal | None]
+    capture_path: str | None = None
+    capture_blocked: bool = False
 
 
 class ObserverState:
@@ -279,7 +283,7 @@ class MarketObserver:
         self.binance = ReadOnlyBinance(cfg)
         self.notifier = Notifier()
         self.state = ObserverState()
-        self.active: dict[str, Capture] = {}
+        self.active: dict[str, Watch] = {}
         self.stop = threading.Event()
 
     @staticmethod
@@ -301,31 +305,50 @@ class MarketObserver:
                 log.warning("Initial order-book read failed market=%s token=%s: %s", market, token, exc)
         return books
 
-    def start_capture(self, market: dict[str, Any], tokens: list[tuple[str, str]], books: dict[str, dict[str, Any]], template: str) -> None:
-        identifier = market_id(market)
+    @staticmethod
+    def ask_summary(tokens: list[tuple[str, str]], books: dict[str, dict[str, Any]]) -> str:
+        values = []
+        for token, label in tokens:
+            ask = best_ask(books.get(token, {}))
+            values.append(f"{label or token}=${ask if ask is not None else 'none'}")
+        return ", ".join(values) or "none"
+
+    @staticmethod
+    def update_lowest(watch: Watch, books: dict[str, dict[str, Any]]) -> None:
+        for token, _ in watch.tokens:
+            ask = best_ask(books.get(token, {}))
+            current = watch.lowest_asks.get(token)
+            if ask is not None and (current is None or ask < current):
+                watch.lowest_asks[token] = ask
+
+    def start_capture(self, watch: Watch, books: dict[str, dict[str, Any]]) -> bool:
+        identifier = watch.market_id
+        tokens, template = watch.tokens, watch.template
         cheap = [(token, label, best_ask(books[token]), notional_at_or_below(books[token], self.cfg.cheap_max)) for token, label in tokens if token in books and (best_ask(books[token]) or Decimal("2")) <= self.cfg.cheap_max]
         if not cheap:
-            return
+            return False
         sample_count = self.state.samples_by_template.get(template, 0)
         if sample_count >= self.cfg.max_samples_per_template:
             log.info("OBSERVER SAMPLE CAP template=%s market=%s", template, identifier)
-            return
+            watch.capture_blocked = True
+            return False
         path = self.capture_path(identifier)
         now = time.time()
-        capture = Capture(identifier, template, now, now + self.cfg.capture_seconds, str(path), market, tokens)
-        self.active[identifier] = capture
+        watch.capture_path = str(path)
         self.state.samples_by_template[template] = sample_count + 1
         self.state.save()
         payload = {
             "kind": "capture_started", "observed_at": now, "market_id": identifier, "template": template,
-            "capture_seconds": self.cfg.capture_seconds, "market": market, "tokens": [{"token_id": token, "label": label} for token, label in tokens],
-            "initial_books": books,
+            "capture_seconds": self.cfg.capture_seconds, "market": watch.market,
+            "tokens": [{"token_id": token, "label": label} for token, label in tokens],
+            "initial_books": watch.initial_books, "cheap_books": books,
         }
         self.append(path, payload)
         details = "\n".join(f"{label or token}: ask ${ask} | depth at <= ${self.cfg.cheap_max}: ${depth}" for token, label, ask, depth in cheap)
-        title = str(market.get("eventTitle") or market.get("title") or identifier)
+        title = str(watch.market.get("eventTitle") or watch.market.get("title") or identifier)
         self.notifier.send("Cheap prediction detected", f"{title}\nTemplate: {template}\n{details}\nRead-only 10-minute capture started.")
         log.warning("OBSERVER CAPTURE START market=%s template=%s file=%s", identifier, template, path)
+        return True
 
     def discover(self) -> None:
         markets = self.binance.markets()
@@ -344,24 +367,42 @@ class MarketObserver:
             template = template_key(market)
             if tokens:
                 books = self.initial_books(identifier, tokens)
-                self.start_capture(market, tokens, books, template)
+                now = time.time()
+                watch = Watch(
+                    identifier, template, now, now + self.cfg.capture_seconds, market, tokens, books,
+                    {token: best_ask(books.get(token, {})) for token, _ in tokens},
+                )
+                self.active[identifier] = watch
+                log.info(
+                    "OBSERVER NEW MARKET market=%s template=%s initial_asks=%s watch=%ss",
+                    identifier, template, self.ask_summary(tokens, books), self.cfg.capture_seconds,
+                )
+                self.start_capture(watch, books)
+            else:
+                log.info("OBSERVER NEW MARKET market=%s template=%s initial_asks=unavailable reason=no_outcome_tokens", identifier, template)
             self.state.save()
 
     def sample_active(self) -> None:
         now = time.time()
-        for identifier, capture in list(self.active.items()):
-            if now >= capture.ends_at:
-                self.append(Path(capture.path), {"kind": "capture_finished", "observed_at": now, "market_id": identifier})
+        for identifier, watch in list(self.active.items()):
+            if now >= watch.ends_at:
+                lowest = {token: str(ask) if ask is not None else None for token, ask in watch.lowest_asks.items()}
+                if watch.capture_path:
+                    self.append(Path(watch.capture_path), {"kind": "capture_finished", "observed_at": now, "market_id": identifier, "lowest_asks": lowest})
                 del self.active[identifier]
-                log.info("OBSERVER CAPTURE FINISHED market=%s file=%s", identifier, capture.path)
+                log.info("OBSERVER WATCH FINISHED market=%s template=%s lowest_asks=%s detailed_file=%s", identifier, watch.template, lowest, watch.capture_path or "none")
                 continue
             books: dict[str, dict[str, Any]] = {}
-            for token, _ in capture.tokens:
+            for token, _ in watch.tokens:
                 try:
                     books[token] = self.binance.order_book(identifier, token)
                 except Exception as exc:
                     books[token] = {"error": str(exc)}
-            self.append(Path(capture.path), {"kind": "snapshot", "observed_at": now, "market_id": identifier, "books": books})
+            self.update_lowest(watch, books)
+            if not watch.capture_path and not watch.capture_blocked:
+                self.start_capture(watch, books)
+            if watch.capture_path:
+                self.append(Path(watch.capture_path), {"kind": "snapshot", "observed_at": now, "market_id": identifier, "books": books})
 
     def run(self) -> None:
         log.warning(

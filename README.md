@@ -8,8 +8,9 @@ When a tracked buy is confirmed filled and the best bid reaches `EXIT_MIN_PRICE`
 
 `observer.py` is a separate service. It has no quote, placement, cancellation,
 or position-management code, so it cannot submit a trade. It inspects every
-market added after its initial startup baseline. Only if the market's *initial signed order-book read*
-contains a real ask at or below `OBSERVER_CHEAP_MAX_PRICE` does it:
+market added after its initial startup baseline. It logs each market's initial
+executable asks and watches it in memory for `OBSERVER_CAPTURE_SECONDS`.
+Only if an ask reaches `OBSERVER_CHEAP_MAX_PRICE` or below during that window does it:
 
 1. send one ntfy phone notification;
 2. write the raw market payload and every outcome's full order book once per

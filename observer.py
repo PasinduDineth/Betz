@@ -188,6 +188,11 @@ class ReadOnlyBinance:
         self.cfg = cfg
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": cfg.key, "Content-Type": "application/x-www-form-urlencoded"})
+        # The public catalog endpoint is JSON POST, unlike Binance's signed
+        # order-book endpoint. Keep it on a distinct session so this header
+        # cannot turn its JSON request into an "Illegal parameter" response.
+        self.market_session = requests.Session()
+        self.market_session.headers.update({"Content-Type": "application/json", "User-Agent": "prediction-market-observer/1.0"})
 
     def signed_get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         values = {**params, "timestamp": int(time.time() * 1000), "recvWindow": 5000}
@@ -209,7 +214,7 @@ class ReadOnlyBinance:
             body = json.loads(os.getenv("BINANCE_MARKETS_BODY_JSON", "{}"))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"BINANCE_MARKETS_BODY_JSON is invalid JSON: {exc}")
-        response = self.session.post(self.cfg.markets_url, json=body, timeout=15)
+        response = self.market_session.post(self.cfg.markets_url, json=body, timeout=15)
         if not response.ok:
             raise RuntimeError(f"Binance market list {response.status_code}: {response.text[:300]}")
         payload = response.json()

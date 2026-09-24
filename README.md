@@ -4,6 +4,32 @@ This project watches Binance's Prediction market event list and Binance predicti
 
 When a tracked buy is confirmed filled and the best bid reaches `EXIT_MIN_PRICE`, it requests a LIMIT SELL quote and submits a GTC SELL order for the tracked filled share quantity.
 
+## Read-only anomaly observer
+
+`observer.py` is a separate service. It has no quote, placement, cancellation,
+or position-management code, so it cannot submit a trade. It inspects every
+market added after its initial startup baseline. Only if the market's *initial signed order-book read*
+contains a real ask at or below `OBSERVER_CHEAP_MAX_PRICE` does it:
+
+1. send one ntfy phone notification;
+2. write the raw market payload and every outcome's full order book once per
+   second for `OBSERVER_CAPTURE_SECONDS` (default: ten minutes);
+3. stop recording that market at the end of the window.
+
+To avoid recording repeated contracts forever, it retains only
+`OBSERVER_MAX_SAMPLES_PER_TEMPLATE` qualifying captures per normalized market
+template (default: two). Files are written under `logs/observer/YYYY-MM-DD/`.
+The live trader and observer run as separate systemd services and use separate
+state and log files.
+
+Install the existing live scanner first, then install the observer:
+
+```bash
+chmod +x install_observer_service.sh
+./install_observer_service.sh
+sudo journalctl -u binance-prediction-observer -f
+```
+
 ## Important
 
 This is real-money software. The default is `LIVE_TRADING=false`. Set it to `true` only after checking every setting and understanding the risks. The bot does not guarantee fills, queue priority, liquidity, or profit.

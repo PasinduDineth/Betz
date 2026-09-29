@@ -23,6 +23,37 @@ template (default: two). Files are written under `logs/observer/YYYY-MM-DD/`.
 The live trader and observer run as separate systemd services and use separate
 state and log files.
 
+## Croatia vs Spain match-result watcher
+
+`match_watcher.py` is a third, independent **read-only** service for the
+Croatia vs Spain match on 6 October 2026. It does not reuse the corners
+strategy and cannot place, quote, cancel, or manage orders. It repeatedly
+searches the Binance catalog for that exact dated event, then selects only a
+three-way match-result market containing Croatia, Spain, and Draw. It monitors
+the Spain outcome's real order book until the service is stopped.
+
+It records full snapshots to `logs/match_watcher/` and sends an ntfy alert when
+all of these are true:
+
+- a Spain seller exists at or below `MATCH_WATCHER_ENTRY_MAX_PRICE`;
+- cumulative ask depth at or below that ceiling covers
+  `MATCH_WATCHER_DESIRED_NOTIONAL` (default: $5).
+
+The alert is evidence to inspect, not permission for an automatic trade. A
+limit order is the appropriate order type if you later decide to buy: it cannot
+pay above its stated ceiling. A limit order that does not match remains a
+pending bid and can fill later, so it needs an explicit expiry/cancellation
+policy before live automation is added.
+
+Install it independently, after the normal Python environment is already
+installed:
+
+```bash
+chmod +x install_match_watcher_service.sh
+./install_match_watcher_service.sh
+sudo journalctl -u binance-prediction-match-watcher -f
+```
+
 Install the existing live scanner first, then install the observer:
 
 ```bash

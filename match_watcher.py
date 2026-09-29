@@ -1,9 +1,8 @@
-"""Read-only watcher for one future Binance Prediction Market match result.
+"""Watcher for one future Binance Prediction Market match result.
 
-This service is deliberately unable to quote, place, cancel, or manage orders.
-It waits for one exact event to appear in Binance's catalog, selects only its
-three-way match-result market, then records the Spain token's executable asks
-and bids.  It is intended to validate liquidity before any real-money decision.
+By default this service is read-only.  When explicitly opted in with
+MATCH_WATCHER_LIVE_TRADING=true, it submits exactly one capped GTC limit-buy
+for the configured target outcome after the exact market is found.
 """
 
 from __future__ import annotations
@@ -115,6 +114,8 @@ def ask_notional(book: dict[str, Any], ceiling: Decimal) -> Decimal:
 class Config:
     key: str = os.getenv("BINANCE_API_KEY", "")
     secret: str = os.getenv("BINANCE_API_SECRET", "")
+    wallet_address: str = os.getenv("BINANCE_WALLET_ADDRESS", "")
+    wallet_id: str = os.getenv("BINANCE_WALLET_ID", "")
     rest_url: str = os.getenv("BINANCE_REST_URL", "https://api.binance.com")
     markets_url: str = os.getenv("BINANCE_MARKETS_URL", "")
     home_team: str = os.getenv("MATCH_WATCHER_HOME_TEAM", "Croatia")
@@ -132,10 +133,15 @@ class Config:
     status_log_seconds: float = float(os.getenv("MATCH_WATCHER_STATUS_LOG_SECONDS", "300"))
     entry_max: Decimal = field(default_factory=lambda: number(os.getenv("MATCH_WATCHER_ENTRY_MAX_PRICE", "0.05"), Decimal("0.05")) or Decimal("0.05"))
     desired_notional: Decimal = field(default_factory=lambda: number(os.getenv("MATCH_WATCHER_DESIRED_NOTIONAL", "5"), Decimal("5")) or Decimal("5"))
+    live_trading: bool = os.getenv("MATCH_WATCHER_LIVE_TRADING", "false").strip().lower() == "true"
+    buy_usdt: Decimal = field(default_factory=lambda: number(os.getenv("MATCH_WATCHER_BUY_USDT", "5"), Decimal("5")) or Decimal("5"))
+    entry_retry_seconds: float = float(os.getenv("MATCH_WATCHER_ENTRY_RETRY_SECONDS", "60"))
+    account_type: str = os.getenv("ACCOUNT_TYPE", "SPOT")
+    funding_source: str = os.getenv("FUNDING_SOURCE", "MPC")
 
     def validate(self) -> None:
         if not self.key or not self.secret:
-            raise RuntimeError("BINANCE_API_KEY and BINANCE_API_SECRET are required for read-only order-book snapshots")
+            raise RuntimeError("BINANCE_API_KEY and BINANCE_API_SECRET are required")
         if not self.markets_url:
             raise RuntimeError("BINANCE_MARKETS_URL is required")
         try:
@@ -144,10 +150,14 @@ class Config:
             raise RuntimeError("MATCH_WATCHER_EVENT_DATE must use YYYY-MM-DD") from exc
         if not self.outcome_aliases or not self.home_aliases:
             raise RuntimeError("Match watcher aliases cannot be empty")
-        if self.poll_seconds <= 0 or self.book_poll_seconds <= 0 or self.log_seconds <= 0 or self.status_log_seconds <= 0:
+        if self.poll_seconds <= 0 or self.book_poll_seconds <= 0 or self.log_seconds <= 0 or self.status_log_seconds <= 0 or self.entry_retry_seconds <= 0:
             raise RuntimeError("Match watcher poll and log intervals must be positive")
-        if not (Decimal("0") < self.entry_max < Decimal("1")) or self.desired_notional <= 0:
+        if not (Decimal("0") < self.entry_max < Decimal("1")) or self.desired_notional <= 0 or self.buy_usdt <= 0 or self.buy_usdt > Decimal("5"):
             raise RuntimeError("Match watcher entry ceiling must be between 0 and 1 and desired notional must be positive")
+        if self.live_trading and not self.wallet_address:
+            raise RuntimeError("MATCH_WATCHER_LIVE_TRADING=true requires BINANCE_WALLET_ADDRESS")
+        if self.live_trading and not self.wallet_id:
+            raise RuntimeError("MATCH_WATCHER_LIVE_TRADING=true requires BINANCE_WALLET_ID")
 
 
 class Notifier:
@@ -170,7 +180,7 @@ class Notifier:
 
 
 class ReadOnlyBinance:
-    """Catalog and order-book reads only. No trade endpoints exist here."""
+    """Catalog/order-book reads and the documented quote-then-limit-order flow."""
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -179,17 +189,43 @@ class ReadOnlyBinance:
         self.market_session = requests.Session()
         self.market_session.headers.update({"Content-Type": "application/json", "User-Agent": "prediction-match-watcher/1.0"})
 
-    def signed_get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        values = {**params, "timestamp": int(time.time() * 1000), "recvWindow": 5000}
+    def signed_request(self, method: str, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        values = {**(params or {}), "timestamp": int(time.time() * 1000), "recvWindow": 5000}
         query = urllib.parse.urlencode(sorted((key, str(value)) for key, value in values.items()))
-        signature = hmac.new(self.cfg.secret.encode(), query.encode("utf-8"), hashlib.sha256).hexdigest()
-        response = self.session.get(f"{self.cfg.rest_url.rstrip('/')}{path}?{query}&signature={signature}", timeout=15)
+        encoded_body = urllib.parse.urlencode(sorted((key, str(value)) for key, value in (body or {}).items()))
+        signature = hmac.new(self.cfg.secret.encode(), (query + encoded_body).encode("utf-8"), hashlib.sha256).hexdigest()
+        response = self.session.request(method, f"{self.cfg.rest_url.rstrip('/')}{path}?{query}&signature={signature}", data=encoded_body or None, timeout=15)
         if not response.ok:
-            raise RuntimeError(f"Binance order-book {response.status_code}: {response.text[:300]}")
+            raise RuntimeError(f"Binance {path} {response.status_code}: {response.text[:300]}")
         return response.json()
 
     def order_book(self, market: str, token: str) -> dict[str, Any]:
-        return self.signed_get("/sapi/v1/w3w/wallet/prediction/order-book", {"vendor": "predict_fun", "marketId": market, "tokenId": token})
+        return self.signed_request("GET", "/sapi/v1/w3w/wallet/prediction/order-book", {"vendor": "predict_fun", "marketId": market, "tokenId": token})
+
+    def get_limit_quote(self, token: str, amount_usdt: Decimal, price_limit: Decimal) -> dict[str, Any]:
+        return self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote", body={
+            "walletAddress": self.cfg.wallet_address,
+            "tokenId": token,
+            "side": "BUY",
+            "amountIn": str(int(amount_usdt * Decimal(10**18))),
+            "orderType": "LIMIT",
+            "slippageBps": 0,
+            "priceLimit": str(price_limit),
+        })
+
+    def place_limit_buy(self, quote: dict[str, Any], price_limit: Decimal) -> str:
+        result = self.signed_request("POST", "/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle", body={
+            "walletAddress": self.cfg.wallet_address,
+            "walletId": self.cfg.wallet_id,
+            "quoteId": quote["quoteId"],
+            "timeInForce": "GTC",
+            "accountType": self.cfg.account_type,
+            "orderType": "LIMIT",
+            "slippageBps": 0,
+            "priceLimit": str(price_limit),
+            "fundingSource": self.cfg.funding_source,
+        })
+        return str(result["orderId"])
 
     def markets(self) -> list[dict[str, Any]]:
         try:
@@ -223,6 +259,10 @@ class State:
     announced_listing: bool = False
     entry_alerted: bool = False
     lowest_ask: str | None = None
+    entry_order_id: str = ""
+    entry_submitted_at: float | None = None
+    last_entry_attempt_at: float = 0.0
+    last_entry_error: str = ""
 
 
 class MatchWatcher:
@@ -311,12 +351,44 @@ class MatchWatcher:
             self.save_state()
         if not self.state.announced_listing or changed:
             event = str(market.get("eventTitle") or market.get("title") or f"{self.cfg.home_team} vs {self.cfg.away_team}")
-            message = f"Found match-result market {identifier}. Watching {label}. No order will be placed."
+            action = "A single live limit-buy will now be attempted." if self.cfg.live_trading else "No order will be placed."
+            message = f"Found match-result market {identifier}. Watching {label}. {action}"
             self.notifier.send("Target prediction market listed", f"{event}\n{message}")
             self.append({"kind": "market_found", "observed_at": time.time(), "market_id": identifier, "token_id": token, "outcome": label, "market": market})
             self.state.announced_listing = True
             self.save_state()
             log.warning("MATCH WATCH FOUND market=%s outcome=%s token=%s", identifier, label, token)
+        self.maybe_submit_entry()
+
+    def maybe_submit_entry(self) -> None:
+        """Submit one pending capped limit bid only after an explicit live opt-in."""
+        if not self.cfg.live_trading or self.state.entry_order_id:
+            return
+        now = time.time()
+        if now - self.state.last_entry_attempt_at < self.cfg.entry_retry_seconds:
+            return
+        self.state.last_entry_attempt_at = now
+        self.save_state()
+        try:
+            quote = self.binance.get_limit_quote(self.state.selected_token_id, self.cfg.buy_usdt, self.cfg.entry_max)
+            order_id = self.binance.place_limit_buy(quote, self.cfg.entry_max)
+            self.state.entry_order_id = order_id
+            self.state.entry_submitted_at = now
+            self.state.last_entry_error = ""
+            self.save_state()
+            message = (
+                f"{self.cfg.home_team} vs {self.cfg.away_team} — {self.state.selected_label}\n"
+                f"Submitted one GTC LIMIT BUY: ${self.cfg.buy_usdt} capped at ${self.cfg.entry_max}.\n"
+                f"Order ID: {order_id}\n"
+                "It may remain pending and can fill later; inspect/cancel it manually if your plan changes."
+            )
+            self.notifier.send("Target limit order submitted", message)
+            self.append({"kind": "limit_buy_submitted", "observed_at": now, "market_id": self.state.selected_market_id, "token_id": self.state.selected_token_id, "outcome": self.state.selected_label, "order_id": order_id, "buy_usdt": self.cfg.buy_usdt, "price_limit": self.cfg.entry_max})
+            log.warning("MATCH WATCH LIVE LIMIT BUY SUBMITTED market=%s outcome=%s order=%s amount=%s price_limit=%s", self.state.selected_market_id, self.state.selected_label, order_id, self.cfg.buy_usdt, self.cfg.entry_max)
+        except Exception as exc:
+            self.state.last_entry_error = str(exc)[:500]
+            self.save_state()
+            log.warning("MATCH WATCH LIVE LIMIT BUY NOT SUBMITTED market=%s: %s", self.state.selected_market_id, exc)
 
     def sample_book(self) -> None:
         if not self.state.selected_market_id or not self.state.selected_token_id:
@@ -338,7 +410,7 @@ class MatchWatcher:
                 f"{self.cfg.home_team} vs {self.cfg.away_team} — {self.state.selected_label}\n"
                 f"Best executable ask: ${ask}; best bid: ${bid if bid is not None else 'none'}\n"
                 f"Ask depth at <= ${self.cfg.entry_max}: ${depth}; target notional: ${self.cfg.desired_notional}\n"
-                "Read-only alert: verify the book manually before any limit order."
+                "Order-book alert: verify the book manually before changing any order."
             )
             self.notifier.send("Potential target entry", message)
             self.state.entry_alerted = True
@@ -355,8 +427,8 @@ class MatchWatcher:
 
     def run(self) -> None:
         log.warning(
-            "MATCH WATCH START read_only=true target=%s vs %s date=%s outcome_aliases=%s entry_max=%s desired_notional=%s",
-            self.cfg.home_team, self.cfg.away_team, self.cfg.event_date, ",".join(self.cfg.outcome_aliases), self.cfg.entry_max, self.cfg.desired_notional,
+            "MATCH WATCH START live_trading=%s target=%s vs %s date=%s outcome_aliases=%s entry_max=%s buy_usdt=%s",
+            self.cfg.live_trading, self.cfg.home_team, self.cfg.away_team, self.cfg.event_date, ",".join(self.cfg.outcome_aliases), self.cfg.entry_max, self.cfg.buy_usdt,
         )
         while not self.stop.is_set():
             now = time.monotonic()

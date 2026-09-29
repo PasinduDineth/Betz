@@ -25,9 +25,8 @@ state and log files.
 
 ## Croatia vs Spain match-result watcher
 
-`match_watcher.py` is a third, independent **read-only** service for the
-Croatia vs Spain match on 6 October 2026. It does not reuse the corners
-strategy and cannot place, quote, cancel, or manage orders. It repeatedly
+`match_watcher.py` is a third, independent service for the Croatia vs Spain
+match on 6 October 2026. It does not reuse the corners strategy. It repeatedly
 searches the Binance catalog for that exact dated event, then selects only a
 three-way match-result market containing Croatia, Spain, and Draw. It monitors
 the Spain outcome's real order book until the service is stopped.
@@ -43,11 +42,17 @@ all of these are true:
 - cumulative ask depth at or below that ceiling covers
   `MATCH_WATCHER_DESIRED_NOTIONAL` (default: $5).
 
-The alert is evidence to inspect, not permission for an automatic trade. A
-limit order is the appropriate order type if you later decide to buy: it cannot
-pay above its stated ceiling. A limit order that does not match remains a
-pending bid and can fill later, so it needs an explicit expiry/cancellation
-policy before live automation is added.
+The default remains read-only (`MATCH_WATCHER_LIVE_TRADING=false`). If you
+explicitly change it to `true`, it submits **exactly one** `$5` GTC LIMIT BUY
+for Spain as soon as the exact match-result market is found. It never uses a
+market order and its price is capped by `MATCH_WATCHER_ENTRY_MAX_PRICE` (default
+`$0.05`). If it cannot get a quote or Binance rejects placement before issuing
+an order ID, it retries after 60 seconds. Once Binance returns an order ID, it
+will not submit another order, including after a restart.
+
+A GTC limit order that does not match becomes a pending bid and can fill later.
+This service does **not** sell or cancel automatically. Inspect the order in
+Binance and cancel it manually if your plan changes.
 
 Install it independently, after the normal Python environment is already
 installed:

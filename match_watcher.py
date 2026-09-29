@@ -129,6 +129,7 @@ class Config:
     poll_seconds: float = float(os.getenv("MATCH_WATCHER_MARKET_POLL_SECONDS", "5"))
     book_poll_seconds: float = float(os.getenv("MATCH_WATCHER_BOOK_POLL_SECONDS", "2"))
     log_seconds: float = float(os.getenv("MATCH_WATCHER_LOG_SECONDS", "10"))
+    status_log_seconds: float = float(os.getenv("MATCH_WATCHER_STATUS_LOG_SECONDS", "300"))
     entry_max: Decimal = field(default_factory=lambda: number(os.getenv("MATCH_WATCHER_ENTRY_MAX_PRICE", "0.05"), Decimal("0.05")) or Decimal("0.05"))
     desired_notional: Decimal = field(default_factory=lambda: number(os.getenv("MATCH_WATCHER_DESIRED_NOTIONAL", "5"), Decimal("5")) or Decimal("5"))
 
@@ -143,7 +144,7 @@ class Config:
             raise RuntimeError("MATCH_WATCHER_EVENT_DATE must use YYYY-MM-DD") from exc
         if not self.outcome_aliases or not self.home_aliases:
             raise RuntimeError("Match watcher aliases cannot be empty")
-        if self.poll_seconds <= 0 or self.book_poll_seconds <= 0 or self.log_seconds <= 0:
+        if self.poll_seconds <= 0 or self.book_poll_seconds <= 0 or self.log_seconds <= 0 or self.status_log_seconds <= 0:
             raise RuntimeError("Match watcher poll and log intervals must be positive")
         if not (Decimal("0") < self.entry_max < Decimal("1")) or self.desired_notional <= 0:
             raise RuntimeError("Match watcher entry ceiling must be between 0 and 1 and desired notional must be positive")
@@ -236,6 +237,7 @@ class MatchWatcher:
         self.last_discovery = 0.0
         self.last_book_poll = 0.0
         self.last_log = 0.0
+        self.last_waiting_log = 0.0
         self.log_path: Path | None = None
 
     def load_state(self) -> State:
@@ -292,7 +294,10 @@ class MatchWatcher:
     def discover(self) -> None:
         selected = self.select_target_market(self.binance.markets())
         if not selected:
-            log.info("MATCH WATCH waiting event=%s vs %s date=%s", self.cfg.home_team, self.cfg.away_team, self.cfg.event_date)
+            now = time.time()
+            if now - self.last_waiting_log >= self.cfg.status_log_seconds:
+                log.info("MATCH WATCH waiting event=%s vs %s date=%s", self.cfg.home_team, self.cfg.away_team, self.cfg.event_date)
+                self.last_waiting_log = now
             return
         market, token, label = selected
         identifier = market_id(market)

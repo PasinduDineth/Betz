@@ -32,6 +32,10 @@ searches the Binance catalog for that exact dated event, then selects only a
 three-way match-result market containing Croatia, Spain, and Draw. It monitors
 the Spain outcome's real order book until the service is stopped.
 
+Catalog polling remains frequent (default: every five seconds), while the
+terminal's "waiting" heartbeat is rate-limited to once every five minutes by
+default (`MATCH_WATCHER_STATUS_LOG_SECONDS=300`).
+
 It records full snapshots to `logs/match_watcher/` and sends an ntfy alert when
 all of these are true:
 

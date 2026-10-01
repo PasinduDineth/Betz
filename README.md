@@ -34,6 +34,9 @@ the Spain outcome's real order book until the service is stopped.
 Catalog polling remains frequent (default: every five seconds), while the
 terminal's "waiting" heartbeat is rate-limited to once every five minutes by
 default (`MATCH_WATCHER_STATUS_LOG_SECONDS=300`).
+Binance returns a maximum of 20 events per catalog response, so the watcher
+rotates through five pages per catalog poll rather than assuming the target is
+on the first page.
 
 It records full snapshots to `logs/match_watcher/` and sends an ntfy alert when
 all of these are true:

@@ -131,6 +131,8 @@ class Config:
     book_poll_seconds: float = float(os.getenv("MATCH_WATCHER_BOOK_POLL_SECONDS", "2"))
     log_seconds: float = float(os.getenv("MATCH_WATCHER_LOG_SECONDS", "10"))
     status_log_seconds: float = float(os.getenv("MATCH_WATCHER_STATUS_LOG_SECONDS", "300"))
+    catalog_page_size: int = int(os.getenv("MATCH_WATCHER_CATALOG_PAGE_SIZE", "20"))
+    catalog_pages_per_poll: int = int(os.getenv("MATCH_WATCHER_CATALOG_PAGES_PER_POLL", "5"))
     entry_max: Decimal = field(default_factory=lambda: number(os.getenv("MATCH_WATCHER_ENTRY_MAX_PRICE", "0.05"), Decimal("0.05")) or Decimal("0.05"))
     desired_notional: Decimal = field(default_factory=lambda: number(os.getenv("MATCH_WATCHER_DESIRED_NOTIONAL", "5"), Decimal("5")) or Decimal("5"))
     live_trading: bool = os.getenv("MATCH_WATCHER_LIVE_TRADING", "false").strip().lower() == "true"
@@ -152,6 +154,8 @@ class Config:
             raise RuntimeError("Match watcher aliases cannot be empty")
         if self.poll_seconds <= 0 or self.book_poll_seconds <= 0 or self.log_seconds <= 0 or self.status_log_seconds <= 0 or self.entry_retry_seconds <= 0:
             raise RuntimeError("Match watcher poll and log intervals must be positive")
+        if not (1 <= self.catalog_page_size <= 20) or self.catalog_pages_per_poll <= 0:
+            raise RuntimeError("Match watcher catalog page size must be 1-20 and pages per poll must be positive")
         if not (Decimal("0") < self.entry_max < Decimal("1")) or self.desired_notional <= 0 or self.buy_usdt <= 0 or self.buy_usdt > Decimal("5"):
             raise RuntimeError("Match watcher entry ceiling must be between 0 and 1 and desired notional must be positive")
         if self.live_trading and not self.wallet_address:
@@ -227,11 +231,17 @@ class ReadOnlyBinance:
         })
         return str(result["orderId"])
 
-    def markets(self) -> list[dict[str, Any]]:
+    def markets_page(self, offset: int, limit: int) -> tuple[list[dict[str, Any]], int]:
         try:
             body = json.loads(os.getenv("BINANCE_MARKETS_BODY_JSON", "{}"))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"BINANCE_MARKETS_BODY_JSON is invalid JSON: {exc}") from exc
+        if not isinstance(body, dict):
+            raise RuntimeError("BINANCE_MARKETS_BODY_JSON must contain an object")
+        # Binance currently caps this endpoint at 20 events.  A rotating scan
+        # is necessary because the default response exposes only page 1 while
+        # the target event can be hundreds of entries later.
+        body = {**body, "offset": offset, "limit": limit}
         response = self.market_session.post(self.cfg.markets_url, json=body, timeout=15)
         if not response.ok:
             raise RuntimeError(f"Binance market list {response.status_code}: {response.text[:300]}")
@@ -248,7 +258,8 @@ class ReadOnlyBinance:
                 children = [item for item in event.get("ungroupedMarkets", []) if isinstance(item, dict)]
             for child in children:
                 flattened.append({**event, **child, "eventId": event.get("eventId"), "eventSlug": event.get("eventSlug"), "eventTitle": event.get("title")})
-        return flattened
+        total = int(data.get("total", len(flattened))) if isinstance(data, dict) else len(flattened)
+        return flattened, max(total, 0)
 
 
 @dataclass
@@ -263,6 +274,7 @@ class State:
     entry_submitted_at: float | None = None
     last_entry_attempt_at: float = 0.0
     last_entry_error: str = ""
+    catalog_offset: int = 0
 
 
 class MatchWatcher:
@@ -332,7 +344,15 @@ class MatchWatcher:
         return None
 
     def discover(self) -> None:
-        selected = self.select_target_market(self.binance.markets())
+        selected: tuple[dict[str, Any], str, str] | None = None
+        total = 0
+        for _ in range(self.cfg.catalog_pages_per_poll):
+            markets, total = self.binance.markets_page(self.state.catalog_offset, self.cfg.catalog_page_size)
+            selected = self.select_target_market(markets)
+            self.state.catalog_offset = (self.state.catalog_offset + self.cfg.catalog_page_size) % total if total else 0
+            if selected:
+                break
+        self.save_state()
         if not selected:
             now = time.time()
             if now - self.last_waiting_log >= self.cfg.status_log_seconds:

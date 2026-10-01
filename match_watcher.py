@@ -297,7 +297,10 @@ class MatchWatcher:
             return State()
         try:
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-            allowed = {key: raw.get(key) for key in State.__dataclass_fields__}
+            # State files created by earlier releases lack newer fields such
+            # as catalog_offset. Preserve their values while using each field's
+            # dataclass default for absent keys.
+            allowed = {key: raw.get(key, definition.default) for key, definition in State.__dataclass_fields__.items()}
             return State(**allowed)
         except Exception as exc:
             log.warning("Could not load match watcher state: %s", exc)
